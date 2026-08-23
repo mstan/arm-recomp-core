@@ -16,8 +16,7 @@ This core is intended to be shared by:
 - [ndsrecomp](https://github.com/mstan/ndsrecomp) for Nintendo DS ARM9/ARM7
   static recompilation and runtime validation.
 - [gbarecomp](https://github.com/mstan/gbarecomp) for Game Boy Advance ARM7TDMI
-  recompilation after the GBA-specific divergence is reconciled into this
-  shared interface.
+  recompilation.
 
 The repository boundary mirrors the `m68k-recomp-core` pattern used by the
 68k-based recompilers: architecture code lives here, while each consumer keeps
@@ -38,7 +37,11 @@ arm_recomp_core_include_dirs(ARM_RECOMP_CORE_INCLUDE_DIRS armv5te_nds)
 Profiles:
 
 - `armv4t`: common decode/IR/interpreter sources.
+- `armv4t_gba`: GBA ARM7TDMI decode/IR/interpreter sources plus the GBA
+  codegen profile.
 - `armv5te_nds`: common sources plus the current NDS ARMv5TE codegen profile.
 
-The NDS runtime ABI (`runtime_arm.h`, dual-CPU dispatch, CP15, live overlays,
-and bus fast paths) remains consumer-owned.
+Runtime ABIs remain consumer-owned. NDS keeps `runtime_arm.h`, dual-CPU
+dispatch, CP15, live overlays, and bus fast paths in `ndsrecomp`; GBA keeps its
+runtime dispatch, symbol registration, overlay shims, and GBA bus/device model
+in `gbarecomp`.
