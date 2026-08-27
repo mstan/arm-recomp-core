@@ -589,10 +589,23 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
                   << ", " << fmt_hex32(target)
                   << ", " << (is_link ? "NDS_LIVE_TRANSFER_BL"
                                       : "NDS_LIVE_TRANSFER_B") << ");\n";
-            s << indent
-              << (is_link ? "runtime_dispatch_literal_call("
-                          : "runtime_dispatch_literal_branch(")
-              << fmt_hex32(target) << ");\n";
+            // B2 validated direct linking. The target is a compile-time
+            // constant, so give the runtime per-callsite storage for the
+            // resolution it would otherwise re-probe out of an 8 MiB
+            // lookup cache on every transfer. The slot is pure cache: the
+            // runtime owns every field, resolves through the ordinary
+            // dispatcher, and re-resolves whenever any bank registers or
+            // unregisters. NDS_DIRECT_LINK=0 makes runtime_link_* behave
+            // exactly like the runtime_dispatch_literal_* entry it
+            // replaced.
+            char slot[64];
+            std::snprintf(slot, sizeof slot, "_lnk_%08X_%c", branch_pc,
+                          is_link ? 'c' : 'b');
+            s << indent << "{ static NdsLinkSlot " << slot << " = {0, 0u, "
+              << fmt_hex32(target | (thumb_link ? 1u : 0u)) << ", 0};\n"
+              << indent << "  "
+              << (is_link ? "runtime_link_call(&" : "runtime_link_branch(&")
+              << slot << "); }\n";
         }
     }
     // B is a tail-call: never return to this caller, so emit
