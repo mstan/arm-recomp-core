@@ -535,6 +535,148 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
           << " = 0u; " << intv << " = 0u;\n";
         return s.str();
     }
+    // ── Tiny-leaf body inlining (beads-yjp.67) ──────────────────────────
+    // OS_DisableInterrupts / OS_RestoreInterrupts and their siblings are
+    // five-instruction MRS/MSR `bx lr` leaves that the MPH ARM9 fight calls
+    // ~1700 times a frame. Each call paid a link-slot dispatch round trip
+    // plus a resume-switch entry to run five instructions. Expand the body
+    // here instead, behind a run-time admission test that reuses the call
+    // site's own B2 slot: the expansion runs only while the runtime has
+    // resolved this exact target to the leaf's owning generated function
+    // under the current link epoch AND that row's content guard is live,
+    // which is precisely the byte-identity proof a linked dispatch makes
+    // before entering the same body. Anything else — an unresolved slot, a
+    // different bank winning the address, a guest write to the leaf's pages,
+    // NDS_INLINE_LEAVES=0 — takes the unchanged link call below, which
+    // re-resolves and re-proves.
+    //
+    // The leaf keeps its own dispatch entry: other callers, the dispatch
+    // table, Tier-3 hand-off and savestate resume all still enter it
+    // normally, and a slice yield inside an expanded body resumes there too
+    // (R15 is published per instruction exactly as in the standalone body).
+    const InlineLeaf* leaf = nullptr;
+    if (is_link && ctx.inline_leaves) {
+        const uint64_t key = function_key(target, ctx.current_function_thumb);
+        // A target that already lowers to a direct C call is not inlined:
+        // the compiler can see that body itself, and duplicating it would
+        // only grow the shard.
+        const bool have_name = ctx.names_by_key &&
+            ctx.names_by_key->find(key) != ctx.names_by_key->end();
+        const bool inside_self = target >= ctx.current_function_addr &&
+            target < ctx.current_function_end_addr;
+        if (!have_name && !inside_self) {
+            auto it = ctx.inline_leaves->find(key);
+            if (it != ctx.inline_leaves->end()) leaf = &it->second;
+        }
+    }
+    if (leaf) {
+        // Render the body FIRST and fail closed: if any leaf instruction is
+        // not lowered, emit_instr would plant a runtime_unimplemented_op abort
+        // inside the expansion — an abort at a site the standalone body would
+        // have reached through the dispatcher. The eligibility pass only
+        // admits lowered ops, so this cannot fire today; it is here so that a
+        // future decoder addition cannot make it fire silently.
+        CodegenCtx leaf_ctx = ctx;
+        leaf_ctx.inline_leaves = nullptr;   // leaf bodies contain no calls
+        leaf_ctx.names_by_key = nullptr;
+        leaf_ctx.force_bx_c_return = false;
+        leaf_ctx.current_function_addr = leaf->addr;
+        leaf_ctx.current_function_end_addr = leaf->terminator_pc;
+        leaf_ctx.current_function_thumb = leaf->thumb;
+        std::ostringstream body_text;
+        bool body_ok = true;
+        for (const Instr& bi : leaf->body) {
+            bool ni = false;
+            body_text << ArmCodegen::emit_instr(bi, leaf_ctx, &ni);
+            if (ni) body_ok = false;
+        }
+        if (!body_ok) leaf = nullptr;
+        if (leaf) {
+        char slot[64];
+        std::snprintf(slot, sizeof slot, "_lnk_%08X_c", branch_pc);
+        const std::string zero_accums = cyc + " = 0u; " + codev + " = 0u; " +
+            datav + " = 0u; " + intv + " = 0u;";
+        const std::string transfer = ctx.trace_live_transfers
+            ? (std::string("runtime_live_transfer(") + fmt_hex32(branch_pc) +
+               ", " + fmt_hex32(target) + ", NDS_LIVE_TRANSFER_BL);")
+            : std::string();
+        s << indent << "{ static NdsLinkSlot " << slot << " = {0, 0u, "
+          << fmt_hex32(target | (thumb_link ? 1u : 0u)) << ", 0};\n";
+        s << indent << "  if (runtime_inline_leaf_admit(&" << slot << ", "
+          << leaf->owner_symbol << ")) {\n";
+        s << indent << "    runtime_tick(" << branch_tick_expr(refill_target)
+          << ");\n";
+        s << indent << "    if (runtime_unwinding()) return;\n";
+        s << indent << "    " << zero_accums << "\n";
+        if (!transfer.empty()) s << indent << "    " << transfer << "\n";
+        // Each body instruction was emitted by the ordinary per-instruction
+        // path above, so it publishes its own R15, counts, fingerprints,
+        // yields and ticks exactly as the standalone body does. The whole
+        // expansion sits in its own C block, which scopes the accumulator
+        // declarations so the same leaf may be inlined many times in one
+        // enclosing function.
+        s << body_text.str();
+        // The terminating `bx lr`. Hand-emitted rather than routed through
+        // emit_instr because this one must FALL THROUGH to the caller's next
+        // instruction instead of returning, and must therefore not run
+        // emit_instr's instruction-boundary epilogue (which would republish
+        // R15 as terminator_pc+4 and tick the branch cost a second time).
+        // Everything else is the BX lowering verbatim: interworking from
+        // bit 0, the taken-branch refill, the unwind check.
+        //
+        // No call-return-stack push was made for this call, so there is no
+        // pop either: if LR is not the return address this expansion was
+        // entered with — the guest reached the leaf's `bx lr` with something
+        // else in LR — the transfer is a real guest branch and dispatches,
+        // exactly as the standalone body's non-matching case does.
+        char bxv[32];
+        std::snprintf(bxv, sizeof bxv, "_ilbx_%08X", branch_pc);
+        s << indent << "    /* inlined leaf terminator 0x"
+          << std::hex << leaf->terminator_pc << std::dec << " bx lr */\n";
+        s << indent << "    g_cpu.R[15] = " << fmt_hex32(leaf->terminator_pc)
+          << ";\n";
+        s << indent << "    if (runtime_should_yield()) return;\n";
+        s << indent << "    ++g_insn_count[g_nds_active];\n";
+        s << indent << "    if (g_insn_hook_armed) runtime_insn_slow();\n";
+        s << indent << "    uint32_t " << bxv << " = g_cpu.R[14];\n";
+        s << indent << "    g_cpu.R[15] = " << bxv << " & ((" << bxv
+          << " & 1u) ? ~1u : ~3u);\n";
+        s << indent << "    if (" << bxv
+          << " & 1u) g_cpu.cpsr |= CPSR_T_BIT; else g_cpu.cpsr &= ~CPSR_T_BIT;\n";
+        s << indent << "    runtime_tick(" << branch_tick_expr(bxv) << ");\n";
+        s << indent << "    if (runtime_unwinding()) return;\n";
+        s << indent << "    if (g_cpu.R[15] != " << fmt_hex32(link_value & ~1u)
+          << ") {\n";
+        if (ctx.trace_live_transfers)
+            s << indent << "      runtime_live_transfer("
+              << fmt_hex32(leaf->terminator_pc) << ", " << bxv
+              << ", NDS_LIVE_TRANSFER_BX);\n";
+        s << indent << "      runtime_dispatch_with_exchange(" << bxv
+          << "); return;\n";
+        s << indent << "    }\n";
+        // Fall through: R15 is the return address and the accumulators are
+        // zero, so emit_instr's epilogue for this BL ticks nothing and
+        // republishes the same R15.
+        s << indent << "  } else {\n";
+        s << indent << "    runtime_call_push_return("
+          << fmt_hex32(link_value & ~1u) << ");\n";
+        s << indent << "    runtime_tick(" << branch_tick_expr(refill_target)
+          << ");\n";
+        s << indent << "    if (runtime_unwinding()) return;\n";
+        s << indent << "    " << zero_accums << "\n";
+        if (!transfer.empty()) s << indent << "    " << transfer << "\n";
+        s << indent << "    runtime_link_call(&" << slot << ");\n";
+        s << indent << "    if (runtime_unwinding()) return;\n";
+        s << indent << "    if (g_cpu.R[15] != " << fmt_hex32(link_value & ~1u)
+          << ") { runtime_call_cancel_return("
+          << fmt_hex32(link_value & ~1u) << "); return; }\n";
+        s << indent << "  }\n";
+        s << indent << "}\n";
+        if (ctx.inline_leaf_sites) ++*ctx.inline_leaf_sites;
+        return s.str();
+        }
+    }
+
     if (is_link) {
         s << indent << "runtime_call_push_return("
           << fmt_hex32(link_value & ~1u) << ");\n";
@@ -1621,11 +1763,22 @@ bool emit_swap(std::ostringstream& body, const Instr& ins,
 }
 
 bool emit_psr(std::ostringstream& body, const Instr& ins,
-              const char* indent) {
+              const CodegenCtx& ctx, const char* indent) {
     if (ins.op == IrOp::MRS) {
-        const char* fn = ins.psr.spsr ? "runtime_mrs_spsr" : "runtime_mrs_cpsr";
+        if (!ins.psr.spsr) {
+            // runtime_mrs_cpsr() is `return g_cpu.cpsr;` in BOTH runtimes
+            // (runner/src/runtime_arm.cpp and the reference
+            // recompiler/armv4t/runtime_arm.cpp). The generated banks are a
+            // separate translation unit from either, so the call could not be
+            // inlined by the compiler and every MRS paid a cross-TU call to
+            // read one field. Emit the field read. SPSR still routes through
+            // the runtime, which has to pick the mode's bank.
+            body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
+                 << "] = g_cpu.cpsr;\n";
+            return true;
+        }
         body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
-             << "] = " << fn << "();\n";
+             << "] = runtime_mrs_spsr();\n";
         return true;
     }
     if (ins.op == IrOp::MSR) {
@@ -1638,8 +1791,64 @@ bool emit_psr(std::ostringstream& body, const Instr& ins,
             body << indent << vv << " = g_cpu.R["
                  << static_cast<unsigned>(ins.op2.shifted.rm) << "];\n";
         }
-        const char* fn = ins.psr.spsr ? "runtime_msr_spsr" : "runtime_msr_cpsr";
-        body << indent << fn << "(" << vv << ", " << static_cast<unsigned>(ins.psr.mask) << "u);\n";
+        const unsigned mask = static_cast<unsigned>(ins.psr.mask);
+        if (ins.psr.spsr) {
+            body << indent << "runtime_msr_spsr(" << vv << ", " << mask
+                 << "u);\n";
+            return true;
+        }
+
+        // ── CPSR write fast path ────────────────────────────────────────
+        // runtime_msr_cpsr's entire body is: expand the 4-bit field mask to
+        // a byte mask, clamp it to the flags byte in User mode, merge, and
+        // — only when the MODE bits changed — swap R13/R14 (and R8..R12 on
+        // FIQ) between register banks. There is NO IRQ recheck in it, on
+        // either side of the write: a newly unmasked IRQ is delivered at the
+        // next runtime_tick boundary exactly as the interpreter oracle
+        // delivers it, and that boundary is emitted by this instruction's
+        // own epilogue. So enabling interrupts loses nothing here — the
+        // recheck it would need never lived in the MSR path to begin with.
+        //
+        // What remains is the mode/bank question, and it is decidable
+        // inline: the mask is a compile-time constant, so the byte mask is
+        // too, and a write can only change the mode when the mask selects
+        // the control byte. When the merged value leaves CPSR[4:0] alone,
+        // mode_to_bank(old) == mode_to_bank(new) by construction and the
+        // whole helper collapses to one masked field write.
+        //
+        // The privileged test is the User-mode clamp: in User mode the
+        // helper drops everything but the flags byte, so any mask that can
+        // reach a non-flags byte takes the faithful path there.
+        uint32_t byte_mask = 0u;
+        if (mask & 1u) byte_mask |= 0x000000FFu;
+        if (mask & 2u) byte_mask |= 0x0000FF00u;
+        if (mask & 4u) byte_mask |= 0x00FF0000u;
+        if (mask & 8u) byte_mask |= 0xFF000000u;
+        const bool flags_only = (byte_mask & ~0xFF000000u) == 0u;
+        const bool can_change_mode = (byte_mask & 0x1Fu) != 0u;
+        if (!ctx.msr_fast_path || byte_mask == 0u) {
+            body << indent << "runtime_msr_cpsr(" << vv << ", " << mask
+                 << "u);\n";
+            return true;
+        }
+        const std::string merge = "g_cpu.cpsr = (g_cpu.cpsr & ~" +
+            fmt_hex32(byte_mask) + ") | (" + vv + " & " +
+            fmt_hex32(byte_mask) + ");";
+        if (flags_only) {
+            // Flags byte only: the User clamp is a no-op and the mode bits
+            // are not in the mask, so the helper is unconditionally a merge.
+            body << indent << merge << "\n";
+            return true;
+        }
+        body << indent << "if ((g_cpu.cpsr & 0x1Fu) != 0x10u";
+        if (can_change_mode)
+            body << " && ((g_cpu.cpsr ^ " << vv << ") & 0x1Fu) == 0u";
+        body << ") {\n";
+        body << indent << "    " << merge << "\n";
+        body << indent << "} else {\n";
+        body << indent << "    runtime_msr_cpsr(" << vv << ", " << mask
+             << "u);\n";
+        body << indent << "}\n";
         return true;
     }
     return false;
@@ -2048,7 +2257,7 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
             ok = emit_swap(os, ins, indent);
             break;
         case IrOp::MRS: case IrOp::MSR:
-            ok = emit_psr(os, ins, indent);
+            ok = emit_psr(os, ins, ctx, indent);
             break;
         case IrOp::MCR: case IrOp::MRC: case IrOp::CDP:
             ok = emit_coprocessor(os, ins, indent);
