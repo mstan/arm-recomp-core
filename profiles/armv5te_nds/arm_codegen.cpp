@@ -148,7 +148,11 @@ void emit_cond_open(std::ostringstream& os, Cond c) {
         os << "    /* cond NV — never executes */\n";
         return;
     }
-    os << "    if (arm_cond_passes(0x" << std::hex
+    // arm_cond_passes_i is the inline form in recompiler/armv4t/runtime_arm.h;
+    // the cond is a literal here, so it folds to the one or two flag tests
+    // this condition needs instead of a cross-TU call into a 16-way switch
+    // (beads-yjp.70 phase 2A).
+    os << "    if (arm_cond_passes_i(0x" << std::hex
        << static_cast<unsigned>(c) << std::dec << "u)) {\n";
 }
 
@@ -217,6 +221,24 @@ std::string cyc_var_for(const Instr& ins) {
 // second time (see arm9_tick_expr's doc comment below).
 std::string code_var_for(const Instr& ins) {
     return "_code" + uniq_suffix(ins);
+}
+// This instruction's own code-fetch cost (numC). Emits the inline form
+// (recompiler/armv4t/runtime_arm.h: nds_code_numc + NDS_ARM9_CODE_K) rather
+// than a runtime_code_cycles(pc) call: for a fixed pc and instruction-set
+// state the four possible values — one per ARM9 code-timing class — are
+// known here, so the emitted constant carries them and the runtime only
+// supplies which class is in force. nds_code_numc returns EXACTLY what
+// runtime_code_cycles(pc) returns (pinned by
+// runner/tests/code_cycles_fold_test.cpp) and falls back to that call for
+// the ARM7 and stale-publication cases. beads-yjp.70 phase 2A.
+//
+// The Thumb term uses the body's STATIC instruction-set state, exactly as
+// every other pc-relative term in this profile does (operand PC reads use
+// pc+4/pc+8 the same way): a dispatch row is keyed by (addr | thumb), so a
+// Thumb body cannot be entered with CPSR.T clear.
+std::string code_numc_expr(uint32_t pc, bool thumb) {
+    return "nds_code_numc(" + fmt_hex32(pc) + ", NDS_ARM9_CODE_K(" +
+           fmt_hex32(pc) + ", " + (thumb ? "1" : "0") + "))";
 }
 std::string data_var_for(const Instr& ins) {
     return "_data" + uniq_suffix(ins);
@@ -2140,7 +2162,7 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
         // the old flat `runtime_tick(1u)` used for both CPUs, so ARM7 is
         // byte-for-byte unchanged.
         s << "    runtime_tick("
-          << arm9_tick_expr_ex("runtime_code_cycles(" + fmt_hex32(ins.pc) + ")",
+          << arm9_tick_expr_ex(code_numc_expr(ins.pc, ins.thumb),
                                "1u", "0u", "0u", false, false, "")
           << ");\n";
         return s.str();
@@ -2181,8 +2203,8 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
     // accumulated only inside the guard), so a runtime cond-fail combines as
     // class C (numC only) — matching melonDS exactly. All three are dead
     // code on the ARM7 path.
-    os << "    uint32_t " << code_var << " = runtime_code_cycles("
-       << fmt_hex32(ins.pc) << ");\n";
+    os << "    uint32_t " << code_var << " = "
+       << code_numc_expr(ins.pc, ins.thumb) << ";\n";
     os << "    uint32_t " << data_var << " = 0u;\n";
     os << "    uint32_t " << int_var << " = 0u;\n";
 
