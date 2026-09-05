@@ -366,7 +366,7 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
         target >= ctx.current_function_addr &&
         target < ctx.current_function_end_addr &&
         target < branch_pc) {
-        s << indent << "runtime_trace_event(RUNTIME_TRACE_BRANCH, "
+        s << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_BRANCH, "
           << fmt_hex32(branch_pc) << ", " << fmt_hex32(target)
           << ", 0u, 0u);\n";
         s << indent << "runtime_tick(" << cyc << ");\n";
@@ -890,21 +890,21 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
         }
         switch (ins.op) {
             case IrOp::STR:
-                body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                      << fmt_hex32(ins.pc) << ", " << ea_var << " & ~3u, "
                      << val_expr << ", 4u);\n";
                 body << indent << "bus_write_u32(" << ea_var << " & ~3u, "
                      << val_expr << ");\n";
                 break;
             case IrOp::STRB:
-                body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                      << fmt_hex32(ins.pc) << ", " << ea_var << ", (uint32_t)("
                      << val_expr << " & 0xFFu), 1u);\n";
                 body << indent << "bus_write_u8(" << ea_var << ", (uint8_t)("
                      << val_expr << " & 0xFFu));\n";
                 break;
             case IrOp::STRH:
-                body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+                body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                      << fmt_hex32(ins.pc) << ", " << ea_var << " & ~1u, (uint32_t)("
                      << val_expr << " & 0xFFFFu), 2u);\n";
                 body << indent << "bus_write_u16(" << ea_var << " & ~1u, (uint16_t)("
@@ -964,7 +964,7 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
             body << indent << "runtime_dispatch(g_cpu.R[15]);\n";
             body << indent << "return;\n";
         } else {
-            body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+            body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                  << fmt_hex32(ins.pc) << ", " << addr_var << " & ~3u, "
                  << fmt_hex32(stm_pc_store_value(ins)) << ", 4u);\n";
             body << indent << "bus_write_u32(" << addr_var << " & ~3u, "
@@ -1050,7 +1050,7 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
                     : ((blk.s_bit ? "runtime_read_user_reg(" : "g_cpu.R[") +
                        std::to_string(r) + (blk.s_bit ? "u)" : "]"));
             }
-            body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+            body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                  << fmt_hex32(ins.pc) << ", " << addr_var << " & ~3u, "
                  << store_val << ", 4u);\n";
             body << indent << "bus_write_u32(" << addr_var
@@ -1210,7 +1210,7 @@ bool emit_swap(std::ostringstream& body, const Instr& ins,
         body << indent << "{ uint32_t _rot = (" << av << " & 3u) * 8u; "
              << "if (_rot) " << ov << " = (" << ov << " >> _rot) | ("
              << ov << " << (32u - _rot)); }\n";
-        body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+        body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
              << fmt_hex32(ins.pc) << ", " << av << " & ~3u, g_cpu.R["
              << static_cast<unsigned>(ins.rm) << "], 4u);\n";
         body << indent << "bus_write_u32(" << av << " & ~3u, g_cpu.R["
@@ -1225,7 +1225,7 @@ bool emit_swap(std::ostringstream& body, const Instr& ins,
         body << indent << "uint32_t " << av << " = g_cpu.R["
              << static_cast<unsigned>(ins.rn) << "];\n";
         body << indent << "uint8_t " << ov << " = bus_read_u8(" << av << ");\n";
-        body << indent << "runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
+        body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
              << fmt_hex32(ins.pc) << ", " << av << ", (uint32_t)(g_cpu.R["
              << static_cast<unsigned>(ins.rm) << "] & 0xFFu), 1u);\n";
         body << indent << "bus_write_u8(" << av << ", (uint8_t)(g_cpu.R["
