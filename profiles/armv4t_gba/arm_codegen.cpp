@@ -414,34 +414,38 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
             function_key(target, ctx.current_function_thumb));
         if (it != ctx.names_by_key->end()) name = &it->second;
     }
-    if (name) {
-        if (!is_link && target == ctx.current_function_addr) {
-            // A tight `b .` loop must not become recursive host C.
-            // Return to the dispatch loop with PC unchanged so the
-            // runtime can observe/stall the guest loop normally.
-        } else {
-            s << indent << *name << "();\n";
-        }
-    } else {
-        if (!is_link && target == ctx.current_function_addr) {
-            // See known-name self-loop case above.
-        } else {
-            s << indent << "runtime_dispatch(" << fmt_hex32(target) << ");\n";
-        }
-    }
-    // B is a tail-call: never return to this caller, so emit
-    // `return;`. BL is a call: after the callee returns (its `bx lr`
-    // sets PC=LR, then C-returns), control must resume in this
-    // function's body at the next instruction. So DO NOT emit
-    // `return;` for BL — let C control fall through to the next
-    // decoded instruction.
-    if (is_link) {
-        s << indent << "if (g_cpu.R[15] != " << fmt_hex32(link_value & ~1u)
-          << ") { runtime_call_cancel_return("
-          << fmt_hex32(link_value & ~1u) << "); return; }\n";
-    } else {
+    const bool self_loop = !is_link && target == ctx.current_function_addr;
+    if (self_loop) {
+        // A tight `b .` loop must not become recursive host C.
+        // Return to the dispatch loop with PC unchanged so the
+        // runtime can observe/stall the guest loop normally.
         s << indent << "return;\n";
+        return s.str();
     }
+    if (!is_link) {
+        // B never returns to this caller: a guaranteed tail transfer.
+        // The macro expands to exactly `<call>; return;` natively and to
+        // a musttail return under Emscripten (see runtime_arm.h).
+        if (name) {
+            s << indent << "GBARECOMP_TAIL_CALL(" << *name << ");\n";
+        } else {
+            s << indent << "GBARECOMP_TAIL_DISPATCH(" << fmt_hex32(target)
+              << ");\n";
+        }
+        return s.str();
+    }
+    // BL is a call: after the callee returns (its `bx lr` sets PC=LR,
+    // then C-returns), control must resume in this function's body at
+    // the next instruction. So DO NOT emit `return;` for BL — let C
+    // control fall through to the next decoded instruction.
+    if (name) {
+        s << indent << *name << "();\n";
+    } else {
+        s << indent << "runtime_dispatch(" << fmt_hex32(target) << ");\n";
+    }
+    s << indent << "if (g_cpu.R[15] != " << fmt_hex32(link_value & ~1u)
+      << ") { runtime_call_cancel_return("
+      << fmt_hex32(link_value & ~1u) << "); return; }\n";
     return s.str();
 }
 
@@ -677,12 +681,8 @@ bool emit_data_processing(std::ostringstream& body, const Instr& ins,
             if (is_lr_return) {
                 body << indent << "if (runtime_call_should_return("
                      << pc_var << ")) return;\n";
-                body << indent << "runtime_dispatch(" << pc_var << ");\n";
-                body << indent << "return;\n";
-            } else {
-                body << indent << "runtime_dispatch(" << pc_var << ");\n";
-                body << indent << "return;\n";
             }
+            body << indent << "GBARECOMP_TAIL_DISPATCH(" << pc_var << ");\n";
         } else {
             body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
                  << "] = " << r_var << ";\n";
@@ -730,14 +730,9 @@ bool emit_branch(std::ostringstream& body, const Instr& ins,
                 // non-caller via BL/BLX from a different source)
                 // is handled by the dispatch path below.
                 body << indent << "if (runtime_call_should_return(g_cpu.R[15])) return;\n";
-                body << indent << "runtime_dispatch_with_exchange("
-                     << target_var << ");\n";
-                body << indent << "return;\n";
-            } else {
-                body << indent << "runtime_dispatch_with_exchange("
-                     << target_var << ");\n";
-                body << indent << "return;\n";
             }
+            body << indent << "GBARECOMP_TAIL_DISPATCH_WITH_EXCHANGE("
+                 << target_var << ");\n";
             return true;
         }
         case IrOp::BL_prefix:
@@ -871,8 +866,7 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
         if (ins.rd == 15) {
             body << indent << "g_cpu.R[15] = " << val_var << " & ~1u;\n";
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
-            body << indent << "runtime_dispatch(" << val_var << " & ~1u);\n";
-            body << indent << "return;\n";
+            body << indent << "GBARECOMP_TAIL_DISPATCH(" << val_var << " & ~1u);\n";
         } else {
             body << indent << "g_cpu.R[" << static_cast<unsigned>(ins.rd)
                  << "] = " << val_var << ";\n";
@@ -961,8 +955,7 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
             }
             body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
-            body << indent << "runtime_dispatch(g_cpu.R[15]);\n";
-            body << indent << "return;\n";
+            body << indent << "GBARECOMP_TAIL_DISPATCH(g_cpu.R[15]);\n";
         } else {
             body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
                  << fmt_hex32(ins.pc) << ", " << addr_var << " & ~3u, "
@@ -1081,12 +1074,8 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
         body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
         if (blk.rn == 13) {
             body << indent << "if (runtime_call_should_return(g_cpu.R[15])) return;\n";
-            body << indent << "runtime_dispatch(g_cpu.R[15]);\n";
-            body << indent << "return;\n";
-        } else {
-            body << indent << "runtime_dispatch(g_cpu.R[15]);\n";
-            body << indent << "return;\n";
         }
+        body << indent << "GBARECOMP_TAIL_DISPATCH(g_cpu.R[15]);\n";
     }
     return true;
 }
@@ -1266,8 +1255,7 @@ bool emit_swi(std::ostringstream& body, const Instr& ins,
               const char* indent) {
     body << indent << "g_cpu.R[15] = "
          << fmt_hex32(ins.pc + (ins.thumb ? 2u : 4u)) << ";\n";
-    body << indent << "runtime_swi(" << fmt_hex32(ins.swi_imm) << ");\n";
-    body << indent << "return;\n";
+    body << indent << "GBARECOMP_TAIL_SWI(" << fmt_hex32(ins.swi_imm) << ");\n";
     return true;
 }
 
