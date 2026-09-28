@@ -70,6 +70,13 @@ struct CodegenCtx {
     // the original compile-time literal, so games that do not explicitly opt
     // in pay no generated-code branch or callback cost.
     const std::unordered_set<uint32_t>* alu_immediate_override_pcs = nullptr;
+
+    // Far-branch BLs: instruction PC (the THUMB BL suffix, or the ARM BL) →
+    // static target, for BLs whose link value the caller's analysis proved
+    // dead at the target. They still write LR architecturally but lower like
+    // B: no call-return frame is pushed, because no guest return can ever
+    // consume it. nullptr/absent → every BL is a call.
+    const std::unordered_map<uint32_t, uint32_t>* link_branch_targets = nullptr;
 };
 
 class ArmCodegen {

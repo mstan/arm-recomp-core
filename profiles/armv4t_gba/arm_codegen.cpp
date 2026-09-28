@@ -337,6 +337,12 @@ const char* mode_is_priv_non_system_expr() {
 // otherwise route through runtime_dispatch. In both cases also
 // update g_cpu.R[15] so any caller that reads PC after the branch
 // (e.g. via stale stack values) sees the right value.
+const uint32_t* link_branch_target(const CodegenCtx& ctx, uint32_t pc) {
+    if (!ctx.link_branch_targets) return nullptr;
+    auto it = ctx.link_branch_targets->find(pc);
+    return it == ctx.link_branch_targets->end() ? nullptr : &it->second;
+}
+
 std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
                                 bool is_link,
                                 uint32_t link_value, bool thumb_link,
@@ -700,6 +706,13 @@ bool emit_branch(std::ostringstream& body, const Instr& ins,
             return true;
         case IrOp::BL: {
             uint32_t link = ins.pc + (ins.thumb ? 2u : 4u);
+            if (const uint32_t* target = link_branch_target(ctx, ins.pc)) {
+                uint32_t lr = ins.thumb ? (link | 1u) : link;
+                body << indent << "g_cpu.R[14] = " << fmt_hex32(lr) << ";\n";
+                body << emit_direct_branch(*target, ins.pc, false, 0,
+                                           ins.thumb, ctx, indent);
+                return true;
+            }
             body << emit_direct_branch(ins.branch_target, ins.pc, true, link,
                                        ins.thumb, ctx, indent);
             return true;
@@ -746,11 +759,19 @@ bool emit_branch(std::ostringstream& body, const Instr& ins,
             // Like ARM BL, this is a CALL — control resumes in this
             // function after the callee's `bx lr` returns. No
             // trailing `return;` (see emit_direct_branch comment).
+            uint32_t new_lr = (ins.pc + 2u) | 1u;
+            if (const uint32_t* target = link_branch_target(ctx, ins.pc)) {
+                // Far branch: the prefix/suffix pair's static target equals
+                // the runtime LR + offset sum (the prefix always precedes).
+                body << indent << "g_cpu.R[14] = " << fmt_hex32(new_lr) << ";\n";
+                body << emit_direct_branch(*target, ins.pc, false, 0,
+                                           ins.thumb, ctx, indent);
+                return true;
+            }
             std::string sfx = uniq_suffix(ins);
             std::string target_var = "_blt" + sfx;
             body << indent << "uint32_t " << target_var << " = "
                  << "(g_cpu.R[14] + " << fmt_hex32(ins.swi_imm) << ") & ~1u;\n";
-            uint32_t new_lr = (ins.pc + 2u) | 1u;
             body << indent << "g_cpu.R[14] = " << fmt_hex32(new_lr) << ";\n";
             body << indent << "g_cpu.R[15] = " << target_var << ";\n";
             body << indent << "runtime_call_push_return("
