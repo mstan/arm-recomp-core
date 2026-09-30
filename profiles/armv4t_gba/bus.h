@@ -37,6 +37,30 @@ struct Bus {
                                    bool /*sequential*/) const {
         return 1;
     }
+
+    // Opcode-fetch wait states: cycles added on top of the base 1 for one
+    // fetch from the code region containing `pc`, 16-bit for THUMB and
+    // 32-bit for ARM. `instr_cycle_base` charges every fetch as a
+    // zero-wait 1S, so the interpreter and the codegen add
+    //   + code_wait(pc, S)                        every instruction
+    //   + code_wait(pc, N) - code_wait(pc, S)     after a data access or
+    //                                             multiply (next fetch is N)
+    //   + code_wait(dst, N) + code_wait(dst, S)   after any PC write
+    // Default 0 keeps a zero-wait bus (IWRAM/BIOS behaviour everywhere).
+    virtual uint32_t code_wait(uint32_t /*pc*/, bool /*thumb*/,
+                               bool /*sequential*/) const {
+        return 0;
+    }
+
+    // GamePak prefetch buffer. `wait` is the stall a data access (or the
+    // internal cycles of a multiply) adds while the instruction at `pc`
+    // executes; the concrete bus returns the adjusted stall (it may be
+    // negative: prefetched opcodes make later fetches free). The default
+    // has no prefetch buffer.
+    virtual int32_t prefetch_stall(int32_t wait, uint32_t /*pc*/,
+                                   bool /*thumb*/) {
+        return wait;
+    }
 };
 
 }  // namespace armv4t

@@ -146,6 +146,92 @@ std::string cyc_var_for(const Instr& ins) {
     return "_cyc" + uniq_suffix(ins);
 }
 
+// ── Opcode-fetch wait states ─────────────────────────────────────────
+// instr_cycle_base counts every fetch as a zero-wait 1S. The real fetch
+// cost depends on the code region (the instruction PC is static here) and
+// on WAITCNT / the EWRAM control register at run time. Regions whose
+// waits are fixed by the bus are folded to constants; EWRAM and the
+// cartridge space read the active bus's RuntimeWaitTable. Mirrors
+// Interpreter::step (Bus::code_wait), the timing oracle.
+uint32_t code_region(uint32_t pc) { return pc >> 24; }
+
+bool region_waits_dynamic(uint32_t region) {
+    return region == 0x2u || (region >= 0x8u && region <= 0xEu);
+}
+
+// Fixed-bus regions: BIOS/IWRAM/IO/OAM are 32-bit zero-wait; palette and
+// VRAM are 16-bit zero-wait (a 32-bit access takes one extra cycle).
+uint32_t region_fixed_wait(uint32_t region, bool thumb) {
+    return (!thumb && (region == 0x5u || region == 0x6u)) ? 1u : 0u;
+}
+
+std::string fetch_wait_expr(uint32_t pc, bool thumb, bool sequential) {
+    const uint32_t region = code_region(pc);
+    if (region > 0xFu) return "0u";
+    if (!region_waits_dynamic(region)) {
+        return std::to_string(region_fixed_wait(region, thumb)) + "u";
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "(uint32_t)g_runtime_waits.%c%s[%u]",
+                  sequential ? 's' : 'n', thumb ? "16" : "32",
+                  static_cast<unsigned>(region));
+    return buf;
+}
+
+// `<base>u` or `<base>u + <fetch wait>` when the wait is not a constant 0.
+std::string cost_with_fetch(uint32_t base, uint32_t pc, bool thumb,
+                            bool sequential) {
+    std::string wait = fetch_wait_expr(pc, thumb, sequential);
+    if (wait == "0u") return std::to_string(base) + "u";
+    if (wait.size() > 1 && wait.back() == 'u' &&
+        wait.find_first_not_of("0123456789") == wait.size() - 1) {
+        return std::to_string(base + static_cast<uint32_t>(
+                                         std::stoul(wait))) + "u";
+    }
+    return std::to_string(base) + "u + " + wait;
+}
+
+// Pipeline refill into a statically known target: an N+S fetch pair in
+// the target region, in the (unchanged) instruction set of the branch.
+std::string static_refill_expr(uint32_t target, bool thumb) {
+    const uint32_t region = code_region(target);
+    if (region > 0xFu) return "";
+    if (!region_waits_dynamic(region)) {
+        const uint32_t w = 2u * region_fixed_wait(region, thumb);
+        return w ? std::to_string(w) + "u" : "";
+    }
+    return fetch_wait_expr(target, thumb, false) + " + " +
+           fetch_wait_expr(target, thumb, true);
+}
+
+// The GamePak prefetch buffer only runs while executing from the cartridge
+// (Bus::prefetch_stall); other code regions never adjust stalls.
+bool code_prefetchable(const Instr& ins) {
+    const uint32_t region = code_region(ins.pc);
+    return region >= 0x8u && region <= 0xDu;
+}
+
+// `_cyc += <prefetch adjustment of a `wait`-cycle stall>;` for ROM code.
+// `addr` is the data address (a multiply passes 0u: always eligible).
+std::string prefetch_adjust_stmt(const Instr& ins, const std::string& wait,
+                                 const std::string& addr,
+                                 const char* indent) {
+    if (!code_prefetchable(ins)) return "";
+    std::ostringstream s;
+    s << indent << cyc_var_for(ins) << " += runtime_prefetch_adjust(" << wait
+      << ", " << addr << ", " << fmt_hex32(ins.pc) << ", "
+      << (ins.thumb ? "1u" : "0u") << ");\n";
+    return s.str();
+}
+
+// `_cyc += runtime_refill_cycles(<pc expr>, <thumb expr>);`
+std::string dynamic_refill_stmt(const Instr& ins, const std::string& pc,
+                                const std::string& thumb,
+                                const char* indent) {
+    return std::string(indent) + cyc_var_for(ins) +
+           " += runtime_refill_cycles(" + pc + ", " + thumb + ");\n";
+}
+
 Op2Code emit_op2(const Instr& ins, const CodegenCtx& ctx,
                  const char* indent) {
     Op2Code out;
@@ -367,6 +453,14 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
     // direct branches (which don't exist on ARMv4T — only BX
     // switches modes), this would need updating.
     s << indent << "g_cpu.R[15] = " << fmt_hex32(target) << ";\n";
+    // Pipeline refill into the (static) target: N+S fetches in its region,
+    // same instruction set (B/BL never switch state). Charged before every
+    // path below ticks, including the `bl next` get-PC idiom whose cost the
+    // fall-through epilogue ticks.
+    {
+        const std::string refill = static_refill_expr(target, thumb_link);
+        if (!refill.empty()) s << indent << cyc << " += " << refill << ";\n";
+    }
 
     if (!is_link &&
         target >= ctx.current_function_addr &&
@@ -616,6 +710,8 @@ bool emit_data_processing(std::ostringstream& body, const Instr& ins,
             // at 0x188) charge 0 instead of their 2S+1N refill — the LP-005
             // cosim divergence: generated=0 vs interpreter reference=3.
             body << indent << "if (" << mode_is_priv_non_system_expr() << ") {\n"
+                 << indent << "    " << cyc_var_for(ins)
+                 << " += runtime_exception_return_refill(" << r_var << ");\n"
                  << indent << "    runtime_tick(" << cyc_var_for(ins) << ");\n"
                  << indent << "    runtime_exception_return(" << r_var << ");\n"
                  << indent << "    return;\n"
@@ -682,7 +778,10 @@ bool emit_data_processing(std::ostringstream& body, const Instr& ins,
                  << (ins.thumb ? " & ~1u" : " & ~3u") << ";\n";
             body << indent << "g_cpu.R[15] = " << pc_var << ";\n";
             // PC write completes the instruction; tick its cost (incl.
-            // the +2 refill folded into _cyc) before transferring.
+            // the +2 refill folded into _cyc and the refill fetches'
+            // wait states in the target region) before transferring.
+            body << dynamic_refill_stmt(ins, pc_var,
+                                        ins.thumb ? "1u" : "0u", indent);
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
             if (is_lr_return) {
                 body << indent << "if (runtime_call_should_return("
@@ -729,8 +828,11 @@ bool emit_branch(std::ostringstream& body, const Instr& ins,
             // instruction-set mode.
             body << indent << "if (" << target_var
                  << " & 1u) g_cpu.cpsr |= CPSR_T_BIT; else g_cpu.cpsr &= ~CPSR_T_BIT;\n";
-            // BX always transfers; tick its cost before either the C-return
-            // or the dispatch path (both exit the function).
+            // BX always transfers; tick its cost (with the refill fetches in
+            // the destination region and instruction set) before either the
+            // C-return or the dispatch path (both exit the function).
+            body << dynamic_refill_stmt(ins, target_var + " & ~1u",
+                                        target_var + " & 1u", indent);
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
             if (ins.rm == 14 || ctx.force_bx_c_return) {
                 // `bx lr` — the AAPCS function-return idiom. In the
@@ -779,6 +881,7 @@ bool emit_branch(std::ostringstream& body, const Instr& ins,
             // Pump the call's cost before transferring; zero _cyc so the
             // fall-through epilogue tick (after the callee C-returns)
             // does not double-count.
+            body << dynamic_refill_stmt(ins, target_var, "1u", indent);
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
             body << indent << cyc_var_for(ins) << " = 0u;\n";
             body << indent << "runtime_dispatch(" << target_var << ");\n";
@@ -830,12 +933,18 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
         case IrOp::LDRH: case IrOp::STRH: case IrOp::LDRSH: access_w = 2u; break;
         default: access_w = 4u; break;
     }
-    body << indent << cyc_var_for(ins) << " += runtime_mem_cycles("
-         << ea_var << ", " << access_w << "u, 0u);\n";
-
     bool is_load = (ins.op == IrOp::LDR || ins.op == IrOp::LDRB ||
                     ins.op == IrOp::LDRH || ins.op == IrOp::LDRSB ||
                     ins.op == IrOp::LDRSH);
+
+    const std::string mc_var = "_mc" + sfx;
+    body << indent << "uint32_t " << mc_var << " = runtime_mem_cycles("
+         << ea_var << ", " << access_w << "u, 0u);\n";
+    body << indent << cyc_var_for(ins) << " += " << mc_var << ";\n";
+    // Prefetch-buffer stall adjustment (ROM code only); a load's stall
+    // includes its trailing internal cycle.
+    body << prefetch_adjust_stmt(ins, is_load ? mc_var + " + 1u" : mc_var,
+                                 ea_var, indent);
 
     if (is_load) {
         std::string val_var = "_v" + sfx;
@@ -886,6 +995,8 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
         // Store the loaded value into Rd. If Rd == PC, dispatch.
         if (ins.rd == 15) {
             body << indent << "g_cpu.R[15] = " << val_var << " & ~1u;\n";
+            body << dynamic_refill_stmt(ins, val_var + " & ~1u",
+                                        ins.thumb ? "1u" : "0u", indent);
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
             body << indent << "GBARECOMP_TAIL_DISPATCH(" << val_var << " & ~1u);\n";
         } else {
@@ -958,8 +1069,13 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
         }
         // Empty-list LDM/STM performs a single N access at the
         // 0x40-stride address (interpreter parity).
-        body << indent << cyc_var_for(ins) << " += runtime_mem_cycles("
+        const std::string mc_var = "_mc" + sfx;
+        body << indent << "uint32_t " << mc_var << " = runtime_mem_cycles("
              << addr_var << " & ~3u, 4u, 0u);\n";
+        body << indent << cyc_var_for(ins) << " += " << mc_var << ";\n";
+        body << prefetch_adjust_stmt(ins,
+                                     blk.load ? mc_var + " + 1u" : mc_var,
+                                     addr_var, indent);
         if (blk.load) {
             std::string pcv = "_pc" + sfx;
             body << indent << "uint32_t " << pcv
@@ -970,11 +1086,15 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
             }
             if (blk.s_bit) {
                 body << indent << "if (" << mode_is_priv_non_system_expr()
-                     << ") { runtime_tick(" << cyc_var_for(ins)
+                     << ") { " << cyc_var_for(ins)
+                     << " += runtime_exception_return_refill(" << pcv
+                     << " & ~1u); runtime_tick(" << cyc_var_for(ins)
                      << "); runtime_exception_return(" << pcv
                      << " & ~1u); return; }\n";
             }
             body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
+            body << dynamic_refill_stmt(ins, "g_cpu.R[15]",
+                                        ins.thumb ? "1u" : "0u", indent);
             body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
             body << indent << "GBARECOMP_TAIL_DISPATCH(g_cpu.R[15]);\n";
         } else {
@@ -1019,14 +1139,29 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
     // sequential (S). Matches the interpreter's per-register cost loop,
     // which matters over slow regions (e.g. EWRAM: 6 N vs 3 S per word).
     bool first_access = true;
+    int highest = 0;
+    for (int r = 0; r < 16; ++r) if (blk.reg_list & (1u << r)) highest = r;
+    const std::string lo_var = "_lo" + sfx;
+    const std::string ba_var = "_ba" + sfx;
+    body << indent << "uint32_t " << lo_var << " = " << addr_var << ";\n";
+    body << indent << "uint32_t " << ba_var << " = 0u;\n";
 
     // Iterate registers in ascending order.
     for (int r = 0; r < 16; ++r) {
         if (!(blk.reg_list & (1u << r))) continue;
-        body << indent << cyc_var_for(ins) << " += runtime_mem_cycles("
+        body << indent << ba_var << " += runtime_mem_cycles("
              << addr_var << " & ~3u, 4u, " << (first_access ? "0u" : "1u")
              << ");\n";
         first_access = false;
+        if (r == highest) {
+            // All access costs are known once the last register's access
+            // is: charge them and the block's prefetch stall (a load's
+            // includes the trailing internal cycle) before any PC-load
+            // exit below ticks the instruction.
+            body << indent << cyc_var_for(ins) << " += " << ba_var << ";\n";
+            body << prefetch_adjust_stmt(
+                ins, blk.load ? ba_var + " + 1u" : ba_var, lo_var, indent);
+        }
         if (blk.load) {
             if (r == 15) {
                 std::string pcv = "_pc" + sfx;
@@ -1034,7 +1169,9 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
                      << " = bus_read_u32(" << addr_var << " & ~3u);\n";
                 if (blk.s_bit) {
                     body << indent << "if (" << mode_is_priv_non_system_expr()
-                         << ") { runtime_tick(" << cyc_var_for(ins)
+                         << ") { " << cyc_var_for(ins)
+                         << " += runtime_exception_return_refill(" << pcv
+                         << " & ~1u); runtime_tick(" << cyc_var_for(ins)
                          << "); runtime_exception_return(" << pcv
                          << " & ~1u); return; }\n";
                     body << indent << "g_cpu.R[15] = " << pcv << " & ~1u;\n";
@@ -1091,7 +1228,10 @@ bool emit_block_transfer(std::ostringstream& body, const Instr& ins,
         // jump (state-machine dispatch, jump tables popped from
         // arbitrary memory). Those still need runtime_dispatch.
         // Every path here exits the function, so tick the accumulated
-        // cost once before any of them.
+        // cost (with the refill fetches at the popped PC) once before any
+        // of them.
+        body << dynamic_refill_stmt(ins, "g_cpu.R[15]",
+                                    ins.thumb ? "1u" : "0u", indent);
         body << indent << "runtime_tick(" << cyc_var_for(ins) << ");\n";
         if (blk.rn == 13) {
             body << indent << "if (runtime_call_should_return(g_cpu.R[15])) return;\n";
@@ -1108,10 +1248,17 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
     auto rn = static_cast<unsigned>(ins.rn);
     auto rm = static_cast<unsigned>(ins.rm);
     auto rs = static_cast<unsigned>(ins.rs);
+    // Multiplier internal cycles: charged, then (ROM code) adjusted by
+    // the prefetch buffer, which keeps fetching while they run.
+    const std::string mw = "_mw" + sfx;
+    const std::string charge_mw =
+        std::string(indent) + cyc_var_for(ins) + " += " + mw + ";\n" +
+        prefetch_adjust_stmt(ins, mw, "0u", indent);
     switch (ins.op) {
         case IrOp::MUL: {
-            body << indent << cyc_var_for(ins) << " += runtime_mul_cycles(g_cpu.R["
+            body << indent << "uint32_t " << mw << " = runtime_mul_cycles(g_cpu.R["
                  << (ins.thumb ? rm : rs) << "], 1u, 0u);\n";
+            body << charge_mw;
             std::string rv = "_r" + sfx;
             body << indent << "uint32_t " << rv << " = g_cpu.R[" << rm
                  << "] * g_cpu.R[" << rs << "];\n";
@@ -1120,8 +1267,9 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
             return true;
         }
         case IrOp::MLA: {
-            body << indent << cyc_var_for(ins)
-                 << " += runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << charge_mw;
             std::string rv = "_r" + sfx;
             body << indent << "uint32_t " << rv << " = g_cpu.R[" << rm
                  << "] * g_cpu.R[" << rs << "] + g_cpu.R[" << rn << "];\n";
@@ -1130,8 +1278,9 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
             return true;
         }
         case IrOp::UMULL: {
-            body << indent << cyc_var_for(ins)
-                 << " += runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 1u);\n";
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 1u);\n";
+            body << charge_mw;
             std::string pv = "_p" + sfx;
             body << indent << "uint64_t " << pv << " = (uint64_t)g_cpu.R["
                  << rm << "] * (uint64_t)g_cpu.R[" << rs << "];\n";
@@ -1146,8 +1295,9 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
             return true;
         }
         case IrOp::UMLAL: {
-            body << indent << cyc_var_for(ins)
-                 << " += runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 2u);\n";
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 0u, 2u);\n";
+            body << charge_mw;
             std::string pv = "_p" + sfx;
             std::string av = "_acc" + sfx;
             std::string sv = "_sum" + sfx;
@@ -1167,8 +1317,9 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
             return true;
         }
         case IrOp::SMULL: {
-            body << indent << cyc_var_for(ins)
-                 << " += runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 1u);\n";
+            body << charge_mw;
             std::string pv = "_p" + sfx;
             body << indent << "int64_t " << pv << " = (int64_t)(int32_t)g_cpu.R["
                  << rm << "] * (int64_t)(int32_t)g_cpu.R[" << rs << "];\n";
@@ -1183,8 +1334,9 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
             return true;
         }
         case IrOp::SMLAL: {
-            body << indent << cyc_var_for(ins)
-                 << " += runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 2u);\n";
+            body << indent << "uint32_t " << mw
+                 << " = runtime_mul_cycles(g_cpu.R[" << rs << "], 1u, 2u);\n";
+            body << charge_mw;
             std::string pv = "_p" + sfx;
             std::string av = "_acc" + sfx;
             std::string sv = "_sum" + sfx;
@@ -1210,11 +1362,24 @@ bool emit_multiply(std::ostringstream& body, const Instr& ins,
 bool emit_swap(std::ostringstream& body, const Instr& ins,
                const char* indent) {
     std::string sfx = uniq_suffix(ins);
+    // 1S+2N+1I: base 2 (1S+1I) plus the read and the write, each a
+    // non-sequential access with its own prefetch stall (read first, with
+    // the trailing I). Mirrors Interpreter::step.
+    auto charge_swap = [&](const std::string& av, unsigned width) {
+        const std::string sa = "_sa" + sfx;
+        body << indent << "uint32_t " << sa << " = runtime_mem_cycles("
+             << av << (width == 4u ? " & ~3u" : "") << ", " << width
+             << "u, 0u);\n";
+        body << indent << cyc_var_for(ins) << " += 2u * " << sa << ";\n";
+        body << prefetch_adjust_stmt(ins, sa + " + 1u", av, indent);
+        body << prefetch_adjust_stmt(ins, sa, av, indent);
+    };
     if (ins.op == IrOp::SWP) {
         std::string av = "_a" + sfx;
         std::string ov = "_o" + sfx;
         body << indent << "uint32_t " << av << " = g_cpu.R["
              << static_cast<unsigned>(ins.rn) << "];\n";
+        charge_swap(av, 4u);
         body << indent << "uint32_t " << ov
              << " = bus_read_u32(" << av << " & ~3u);\n";
         body << indent << "{ uint32_t _rot = (" << av << " & 3u) * 8u; "
@@ -1234,6 +1399,7 @@ bool emit_swap(std::ostringstream& body, const Instr& ins,
         std::string ov = "_o" + sfx;
         body << indent << "uint32_t " << av << " = g_cpu.R["
              << static_cast<unsigned>(ins.rn) << "];\n";
+        charge_swap(av, 1u);
         body << indent << "uint8_t " << ov << " = bus_read_u8(" << av << ");\n";
         body << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_MEM_WRITE, "
              << fmt_hex32(ins.pc) << ", " << av << ", (uint32_t)(g_cpu.R["
@@ -1314,7 +1480,8 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
         s << "    if (g_runtime_insn_trace) runtime_insn_fp();\n";
         s << "    g_cpu.R[15] = "
           << fmt_hex32(ins.pc + (ins.thumb ? 2u : 4u)) << ";\n";
-        s << "    runtime_tick(1u);\n";
+        s << "    runtime_tick("
+          << cost_with_fetch(1u, ins.pc, ins.thumb, true) << ");\n";
         return s.str();
     }
 
@@ -1330,24 +1497,25 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
     // instruction is not fingerprinted. Zero cost when disarmed.
     os << "    if (g_runtime_insn_trace) runtime_insn_fp();\n";
 
-    // Per-instruction cycle accumulator. Starts at the cond-fail cost
-    // (1S fetch); the cond-pass block raises it to the full execute cost,
-    // and memory/multiply ops add their runtime-dependent component. A
+    // Per-instruction cycle accumulator. A conditional op starts at the
+    // cond-fail cost (1S fetch) and the cond-pass block raises it to the
+    // full execute cost (an unconditional op starts there); memory/multiply
+    // ops add their runtime-dependent component. A
     // single runtime_tick(_cyc) at the instruction boundary (epilogue
     // below) pumps the PPU/audio/timers and delivers any pending IRQ —
     // matching the interpreter oracle, which pumps the full cost AFTER
     // executing and checks IRQs at the next boundary.
+    // Every cost below includes this instruction's own opcode-fetch wait
+    // states (fetch_wait_expr): S normally, N after a data access or a
+    // multiply (next_fetch_nonsequential).
     const std::string cyc_var = cyc_var_for(ins);
-    os << "    uint32_t " << cyc_var << " = 1u;\n";
-
-    emit_cond_open(os, ins.cond);
-    const char* indent = indent_for(ins.cond);
 
     // Static execute cost = base (fetch + internal cycles; branch refill
     // folded in) + register-shift surcharge + non-branch PC-write refill.
-    // Mirrors interpreter.cpp's cost assembly. SWI ticks its own 3 cycles
+    // Mirrors interpreter.cpp's cost assembly. SWI ticks its own cost
     // inside runtime_swi (after masking IRQs), so it leaves _cyc at the
     // fetch baseline (used only on the cond-fail path).
+    std::string exec_cost_expr;
     if (ins.op != IrOp::SWI) {
         uint32_t exec_cost = instr_cycle_base(ins.op);
         if (ins.op2.kind == Op2::Kind::Shifted &&
@@ -1357,7 +1525,23 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
         if (writes_pc_nonbranch(ins)) {
             exec_cost += 2u;  // pipeline refill
         }
-        os << indent << cyc_var << " = " << exec_cost << "u;\n";
+        exec_cost_expr = cost_with_fetch(exec_cost, ins.pc, ins.thumb,
+                                         !next_fetch_nonsequential(ins.op));
+    }
+    // An unconditional instruction starts at its execute cost; a
+    // conditional one at the cond-fail cost (the 1S fetch), raised inside
+    // the condition block.
+    const bool unconditional =
+        cond_always(ins.cond) && !exec_cost_expr.empty();
+    os << "    uint32_t " << cyc_var << " = "
+       << (unconditional ? exec_cost_expr
+                         : cost_with_fetch(1u, ins.pc, ins.thumb, true))
+       << ";\n";
+
+    emit_cond_open(os, ins.cond);
+    const char* indent = indent_for(ins.cond);
+    if (!unconditional && !exec_cost_expr.empty()) {
+        os << indent << cyc_var << " = " << exec_cost_expr << ";\n";
     }
 
     bool ok = false;

@@ -102,8 +102,10 @@ const char* ir_op_name(IrOp op) noexcept;
 // and the runtime tick helpers — so the recompiled cycle stream advances
 // the PPU / audio / timers exactly like the interpreter does, byte-for-byte.
 //
-// `instr_cycle_base` is the FIXED part of an op's cost: the 1S fetch plus
-// any internal (I) cycles, with the branch pipeline-refill folded in. The
+// `instr_cycle_base` is the FIXED part of an op's cost: the 1S fetch (as a
+// zero-wait access; fetch wait states are added per code region, see
+// `next_fetch_nonsequential`) plus any internal (I) cycles, with the branch
+// pipeline-refill (2 zero-wait fetches) folded in. The
 // memory-access (N/S) cycles and operand-dependent multiply cycles are NOT
 // included here — they depend on the runtime target region / operand and
 // are added at execute time via `Bus::access_cycles` and `mul_wait_cycles`.
@@ -112,6 +114,15 @@ const char* ir_op_name(IrOp op) noexcept;
 //   + 1  when Op2 is a register-shifted operand (extra shifter I-cycle)
 //   + 2  when a NON-branch op writes PC (pipeline refill)
 uint32_t instr_cycle_base(IrOp op) noexcept;
+
+// True when the opcode fetch that follows `op` is non-sequential because
+// the instruction used the bus for data (LDR/STR/LDM/STM families) or ran
+// multiplier internal cycles. The base cost above assumes zero-wait fetches;
+// callers add the fetch wait states of the executing code region on top:
+// S for every instruction, N instead of S when this returns true, and an
+// N+S pair of the destination region after any PC write. SWP/SWPB are
+// deliberately excluded (mGBA isa-arm.c charges no N adjust for them).
+bool next_fetch_nonsequential(IrOp op) noexcept;
 
 // ARM7TDMI multiply m-cycle count for the multiplier operand `rs_value`.
 // `extra` is the accumulate/long adjustment (0 for MUL; 1 for MLA, UMULL,

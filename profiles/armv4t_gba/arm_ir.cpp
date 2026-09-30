@@ -110,7 +110,8 @@ uint32_t instr_cycle_base(IrOp op) noexcept {
         case IrOp::STM:
             return 1;
         case IrOp::SWP:  case IrOp::SWPB:
-            return 3;  // 1S+1I + extra trailing cycle
+            return 2;  // 1S+1I; the read and the write each add a
+                       // non-sequential access at execute time (1S+2N+1I)
 
         // MUL family: prefetch here; execute adds the operand-dependent
         // ARM_WAIT_*MUL cycles via mul_wait_cycles().
@@ -125,6 +126,21 @@ uint32_t instr_cycle_base(IrOp op) noexcept {
         case IrOp::Undefined:
         default:
             return 1;
+    }
+}
+
+bool next_fetch_nonsequential(IrOp op) noexcept {
+    switch (op) {
+        case IrOp::LDR:   case IrOp::LDRB:
+        case IrOp::LDRH:  case IrOp::LDRSB: case IrOp::LDRSH:
+        case IrOp::STR:   case IrOp::STRB:  case IrOp::STRH:
+        case IrOp::LDM:   case IrOp::STM:
+        case IrOp::MUL:   case IrOp::MLA:
+        case IrOp::UMULL: case IrOp::UMLAL:
+        case IrOp::SMULL: case IrOp::SMLAL:
+            return true;
+        default:
+            return false;
     }
 }
 
