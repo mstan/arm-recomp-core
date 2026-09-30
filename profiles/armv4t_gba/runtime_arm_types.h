@@ -86,6 +86,22 @@ typedef struct RuntimeTraceEntry {
     uint32_t r14;
 } RuntimeTraceEntry;
 
+// GBA bus wait states, read directly by generated code for the fetch cost
+// of each instruction and owned by the concrete bus (one per machine). Every
+// entry is the number of wait cycles on top of the single base bus cycle of
+// one access in region `addr >> 24`, the same convention as mGBA's
+// waitstates tables: n = non-sequential, s = sequential, 16/32 = access
+// width. ROM/SRAM entries follow WAITCNT, EWRAM follows the internal memory
+// control register; the rest are fixed by the bus widths.
+typedef struct RuntimeWaitTable {
+    uint8_t n16[16];
+    uint8_t s16[16];
+    uint8_t n32[16];
+    uint8_t s32[16];
+    uint32_t prefetch;           // WAITCNT bit 14: GamePak prefetch buffer on
+    uint32_t last_prefetched_pc; // prefetch-buffer model state (see bus)
+} RuntimeWaitTable;
+
 typedef struct RuntimeFpEntry {
     unsigned long long cycles;  // cumulative guest cycles BEFORE this instruction
     uint32_t pc;

@@ -468,6 +468,13 @@ bool is_priv_non_system(uint8_t mode) {
 // branches the refill is folded into `cycle_cost_base` so we don't
 // double-count.
 //
+// Opcode fetches are charged by code region on top of that zero-wait base
+// (Bus::code_wait): S every instruction, N instead after a data access or a
+// multiply (next_fetch_nonsequential), and the refill N+S pair in the target
+// region after a PC write. From cartridge ROM with the GamePak prefetch
+// buffer on, data-access and multiply stalls go through Bus::prefetch_stall.
+// The codegen emits the same terms (docs/CPU_TIMING.md in gbarecomp).
+//
 // Reference: GBATEK § "GBA Memory Map - Bus Width and Speed",
 // ARM7TDMI TRM § "Instruction Cycle Times", and `GbaBus::access_cycles`.
 
@@ -489,8 +496,8 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
     if (!cond_passes(i.cond, cpu.cpsr)) {
         // Auto-advance and report Normal. A condition-failed
         // instruction still costs 1S for its fetch.
+        if (cycles_out) *cycles_out = 1 + bus.code_wait(i.pc, i.thumb, true);
         cpu.R[15] += i.thumb ? kThumbInsnBytes : kArmInsnBytes;
-        if (cycles_out) *cycles_out = 1;
         return Result::Normal;
     }
 
@@ -508,6 +515,25 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
     // pipeline-refill surcharge for PC-writing non-branch ops.
     uint32_t mem_cycles = 0;
     uint32_t extra_cycles = 0;
+    // GamePak prefetch-buffer adjustment of the data-access / multiply
+    // stalls (Bus::prefetch_stall; 0 unless executing from ROM with the
+    // prefetch buffer enabled). Signed: prefetched opcodes save cycles.
+    int32_t stall_delta = 0;
+    // Only CPU data accesses below the cartridge space let the prefetch
+    // buffer keep fetching opcodes; a ROM/SRAM data access owns the
+    // GamePak bus (mGBA memory.c: `address < GBA_BASE_ROM0`).
+    auto stall = [&](uint32_t wait, uint32_t addr) {
+        if (addr < 0x08000000u) {
+            stall_delta += bus.prefetch_stall(static_cast<int32_t>(wait),
+                                              i.pc, i.thumb) -
+                           static_cast<int32_t>(wait);
+        }
+    };
+    // Multiplier m-cycles; the prefetch buffer keeps fetching during them.
+    auto charge_mul = [&](uint32_t wait) {
+        extra_cycles += wait;
+        stall(wait, 0u);
+    };
 
     switch (i.op) {
         // ── Data processing ────────────────────────────────────────
@@ -695,7 +721,15 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
                 default:
                     access_w = 4; break;
             }
-            mem_cycles += bus.access_cycles(effective_addr, access_w, false);
+            const uint32_t access = bus.access_cycles(effective_addr, access_w, false);
+            mem_cycles += access;
+            {
+                const bool load = i.op == IrOp::LDR || i.op == IrOp::LDRB ||
+                                  i.op == IrOp::LDRH || i.op == IrOp::LDRSB ||
+                                  i.op == IrOp::LDRSH;
+                // A load's stall includes its trailing internal cycle.
+                stall(access + (load ? 1u : 0u), effective_addr);
+            }
 
             // Load form.
             if (i.op == IrOp::LDR || i.op == IrOp::LDRB ||
@@ -779,8 +813,10 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
                 uint32_t final_base = i.block.add
                     ? base + 0x40u
                     : base - 0x40u;
-                mem_cycles += bus.access_cycles(addr & ~3u, 4,
-                                                /*sequential=*/false);
+                const uint32_t access = bus.access_cycles(addr & ~3u, 4,
+                                                          /*sequential=*/false);
+                mem_cycles += access;
+                stall(access + (i.block.load ? 1u : 0u), addr);
                 if (i.block.load) {
                     uint32_t v = bus.read32(addr & ~3u);
                     if (i.block.writeback) cpu.R[i.block.rn] = final_base;
@@ -821,10 +857,11 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             // (e.g., EWRAM at 6 cycles per N + 3 cycles per S for
             // 32-bit). LDM keeps the 1I cycle from cycle_cost_base.
             bool first_access = true;
+            uint32_t block_access = 0;
             for (int reg = 0; reg < 16; ++reg) {
                 if (!(list & (1u << reg))) continue;
-                mem_cycles += bus.access_cycles(cursor & ~3u, 4,
-                                                /*sequential=*/!first_access);
+                block_access += bus.access_cycles(cursor & ~3u, 4,
+                                                  /*sequential=*/!first_access);
                 first_access = false;
                 if (i.block.load) {
                     uint32_t v = bus.read32(cursor & ~3u);
@@ -863,6 +900,8 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
                 }
                 cursor += 4;
             }
+            mem_cycles += block_access;
+            stall(block_access + (i.block.load ? 1u : 0u), lowest);
             bool base_in_list = (list & (1u << i.block.rn)) != 0;
             if (i.block.writeback && !(i.block.load && base_in_list)) {
                 cpu.R[i.block.rn] = final_base;
@@ -873,7 +912,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
         // ── Multiply (32-bit) ──────────────────────────────────────
         case IrOp::MUL: {
             uint32_t wait_operand = i.thumb ? cpu.R[i.rm] : cpu.R[i.rs];
-            extra_cycles += mul_wait_cycles(wait_operand, /*signed=*/true, 0);
+            charge_mul(mul_wait_cycles(wait_operand, /*signed=*/true, 0));
             uint32_t r = cpu.R[i.rm] * cpu.R[i.rs];
             cpu.R[i.rd] = r;
             if (i.set_flags) {
@@ -885,7 +924,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             break;
         }
         case IrOp::MLA: {
-            extra_cycles += mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 1);
+            charge_mul(mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 1));
             // Decoder layout: Rd=destination (and accumulator source
             // from Rn slot), Rm × Rs + Rn → Rd.
             uint32_t r = cpu.R[i.rm] * cpu.R[i.rs] + cpu.R[i.rn];
@@ -904,7 +943,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
         //   Rs (bits 11..8), Rm (bits 3..0)
         // Result low word → R[Rn]; high word → R[Rd].
         case IrOp::UMULL: {
-            extra_cycles += mul_wait_cycles(cpu.R[i.rs], /*signed=*/false, 1);
+            charge_mul(mul_wait_cycles(cpu.R[i.rs], /*signed=*/false, 1));
             uint64_t prod = static_cast<uint64_t>(cpu.R[i.rm]) *
                             static_cast<uint64_t>(cpu.R[i.rs]);
             cpu.R[i.rn] = static_cast<uint32_t>(prod & 0xFFFFFFFFu);
@@ -916,7 +955,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             break;
         }
         case IrOp::UMLAL: {
-            extra_cycles += mul_wait_cycles(cpu.R[i.rs], /*signed=*/false, 2);
+            charge_mul(mul_wait_cycles(cpu.R[i.rs], /*signed=*/false, 2));
             uint64_t prod = static_cast<uint64_t>(cpu.R[i.rm]) *
                             static_cast<uint64_t>(cpu.R[i.rs]);
             uint64_t acc = (static_cast<uint64_t>(cpu.R[i.rd]) << 32) |
@@ -931,7 +970,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             break;
         }
         case IrOp::SMULL: {
-            extra_cycles += mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 1);
+            charge_mul(mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 1));
             int64_t prod = static_cast<int64_t>(static_cast<int32_t>(cpu.R[i.rm])) *
                            static_cast<int64_t>(static_cast<int32_t>(cpu.R[i.rs]));
             uint64_t u = static_cast<uint64_t>(prod);
@@ -944,7 +983,7 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             break;
         }
         case IrOp::SMLAL: {
-            extra_cycles += mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 2);
+            charge_mul(mul_wait_cycles(cpu.R[i.rs], /*signed=*/true, 2));
             int64_t prod = static_cast<int64_t>(static_cast<int32_t>(cpu.R[i.rm])) *
                            static_cast<int64_t>(static_cast<int32_t>(cpu.R[i.rs]));
             uint64_t acc = (static_cast<uint64_t>(cpu.R[i.rd]) << 32) |
@@ -962,6 +1001,13 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
         // ── Swap (atomic) ─────────────────────────────────────────
         case IrOp::SWP: {
             uint32_t addr = cpu.R[i.rn];
+            // 1S+2N+1I: the read (with the trailing I) then the write, each
+            // a non-sequential access with its own prefetch stall (mGBA
+            // isa-arm.c SWP: load32 then store32, no fetch N/S adjust).
+            const uint32_t access = bus.access_cycles(addr & ~3u, 4, false);
+            mem_cycles += 2u * access;
+            stall(access + 1u, addr);
+            stall(access, addr);
             uint32_t orig = bus.read32(addr & ~3u);
             uint32_t rot = (addr & 3u) * 8u;
             orig = rotr32(orig, rot);
@@ -971,6 +1017,10 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
         }
         case IrOp::SWPB: {
             uint32_t addr = cpu.R[i.rn];
+            const uint32_t access = bus.access_cycles(addr, 1, false);
+            mem_cycles += 2u * access;
+            stall(access + 1u, addr);
+            stall(access, addr);
             uint8_t orig = bus.read8(addr);
             bus.write8(addr, static_cast<uint8_t>(cpu.R[i.rm] & 0xFFu));
             cpu.R[i.rd] = orig;
@@ -1120,7 +1170,12 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
 
         // ── Software interrupt ─────────────────────────────────────
         case IrOp::SWI:
-            if (cycles_out) *cycles_out = instr_cycle_base(i.op);
+            // The SVC vector is in the zero-wait BIOS, so only the SWI's
+            // own fetch wait adds to the base 2S+1N.
+            if (cycles_out) {
+                *cycles_out = instr_cycle_base(i.op) +
+                              bus.code_wait(i.pc, i.thumb, true);
+            }
             return Result::Swi;
 
         default:
@@ -1148,6 +1203,21 @@ Interpreter::Result Interpreter::step(CPUState& cpu, Bus& bus, const Instr& i,
             c += 1;
         }
         if (wrote_pc && !branch_op) c += 2;
+        // Opcode-fetch wait states (Bus::code_wait). The base cost counts
+        // every fetch as a zero-wait 1S; charge the real S fetch of this
+        // instruction, make the fetch after a data access or a multiply's
+        // internal cycles non-sequential, and refill the pipeline with an
+        // N+S fetch pair in the destination region and instruction set.
+        const uint32_t fetch_s = bus.code_wait(i.pc, i.thumb, true);
+        const bool fetch_n = next_fetch_nonsequential(i.op);
+        c += fetch_n ? bus.code_wait(i.pc, i.thumb, false) : fetch_s;
+        if (wrote_pc) {
+            const uint32_t dst = cpu.R[15];
+            const bool dst_thumb = cpu.cpsr.t;
+            c += bus.code_wait(dst, dst_thumb, false) +
+                 bus.code_wait(dst, dst_thumb, true);
+        }
+        c = static_cast<uint32_t>(static_cast<int32_t>(c) + stall_delta);
         *cycles_out = c;
     }
 
