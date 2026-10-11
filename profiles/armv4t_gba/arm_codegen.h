@@ -94,6 +94,15 @@ struct CodegenCtx {
     // B: no call-return frame is pushed, because no guest return can ever
     // consume it. nullptr/absent → every BL is a call.
     const std::unordered_map<uint32_t, uint32_t>* link_branch_targets = nullptr;
+
+    // In-body goto targets: instruction addresses inside
+    // [current_function_addr, current_function_end_addr) that carry a C label
+    // in the emitted body (backward branch targets + mid-function
+    // alias/resume entries, including branch-target blocks rolled in from the
+    // walk-end gap by the finder). A direct branch to one of these lowers to
+    // `goto L_<addr>` instead of a C call, keeping split loops inside a single
+    // host frame. nullptr → forward in-body branches lower to calls as before.
+    const std::unordered_set<uint32_t>* in_body_goto_targets = nullptr;
 };
 
 class ArmCodegen {
