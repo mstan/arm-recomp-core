@@ -507,10 +507,13 @@ std::string emit_direct_branch(uint32_t target, uint32_t branch_pc,
         if (!refill.empty()) s << indent << cyc << " += " << refill << ";\n";
     }
 
-    if (!is_link &&
+    const bool in_body_goto =
         target >= ctx.current_function_addr &&
         target < ctx.current_function_end_addr &&
-        target < branch_pc) {
+        (target < branch_pc ||
+         (ctx.in_body_goto_targets != nullptr &&
+          ctx.in_body_goto_targets->count(target) != 0));
+    if (!is_link && in_body_goto) {
         s << indent << "if (runtime_trace_enabled()) runtime_trace_event(RUNTIME_TRACE_BRANCH, "
           << pc_expr(branch_pc, ctx) << ", " << pc_expr(target, ctx)
           << ", 0u, 0u);\n";
