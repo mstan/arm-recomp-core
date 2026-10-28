@@ -986,8 +986,8 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
                     ins.op == IrOp::LDRSH);
 
     if (ctx.native_region) {
-        body << indent << "if (!_region.ram_range(" << ea_var << ", " << access_w
-             << "u)) { _region.commit(); goto NR_REF_" << std::hex << ins.pc
+        body << indent << "if (!_region.memory_range(" << ea_var << ", " << access_w
+             << "u, " << (is_load ? "false" : "true") << ")) { _region.commit(); goto NR_REF_" << std::hex << ins.pc
              << std::dec << "; }\n";
     }
     const std::string mc_var = "_mc" + sfx;
