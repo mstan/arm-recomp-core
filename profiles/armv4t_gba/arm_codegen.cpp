@@ -985,6 +985,11 @@ bool emit_memory(std::ostringstream& body, const Instr& ins,
                     ins.op == IrOp::LDRH || ins.op == IrOp::LDRSB ||
                     ins.op == IrOp::LDRSH);
 
+    if (ctx.native_region) {
+        body << indent << "if (!_region.ram_range(" << ea_var << ", " << access_w
+             << "u)) { _region.commit(); goto NR_REF_" << std::hex << ins.pc
+             << std::dec << "; }\n";
+    }
     const std::string mc_var = "_mc" + sfx;
     body << indent << "uint32_t " << mc_var << " = runtime_mem_cycles("
          << ea_var << ", " << access_w << "u, 0u);\n";
@@ -1500,10 +1505,10 @@ bool emit_swi(std::ostringstream& body, const Instr& ins,
 // Public API
 // ─────────────────────────────────────────────────────────────────────
 
-std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
+static std::string emit_reference_instr(const Instr& ins, const CodegenCtx& ctx,
                                    bool* not_implemented) {
     if (ctx.runtime_arm_immediate && (ctx.runtime_pc_base.empty() ||
-        !supports_runtime_arm_immediate(ins)))
+        !ArmCodegen::supports_runtime_arm_immediate(ins)))
         throw std::invalid_argument("live ARM immediate requires a guarded AL non-S MOV/ADD without PC operands");
     if (!ctx.runtime_pc_base.empty() &&
         ((code_region(ins.pc) != 2u && code_region(ins.pc) != 3u &&
@@ -1662,6 +1667,92 @@ std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
        << pc_expr(ins.pc + (ins.thumb ? 2u : 4u), ctx) << ";\n";
     os << "    runtime_tick(" << cyc_var << ");\n";
     return os.str();
+}
+
+bool ArmCodegen::supports_native_region(const Instr& ins) {
+    if(ins.is_undefined || ins.is_branch || ins.is_pc_writing) return false;
+    switch(ins.op) {
+    case IrOp::TST: case IrOp::TEQ: case IrOp::CMP: case IrOp::CMN: return true;
+    case IrOp::AND: case IrOp::EOR: case IrOp::SUB: case IrOp::RSB:
+    case IrOp::ADD: case IrOp::ADC: case IrOp::SBC: case IrOp::RSC:
+    case IrOp::ORR: case IrOp::MOV: case IrOp::BIC: case IrOp::MVN:
+    case IrOp::LDR: case IrOp::LDRB: case IrOp::LDRH: case IrOp::LDRSB:
+    case IrOp::LDRSH: case IrOp::STR: case IrOp::STRB: case IrOp::STRH:
+        return ins.rd != 15;
+    default: return false;
+    }
+}
+
+std::string ArmCodegen::emit_instr(const Instr& ins, const CodegenCtx& ctx,
+                                  bool* not_implemented) {
+    if(!ctx.native_region) return emit_reference_instr(ins,ctx,not_implemented);
+    if(!supports_native_region(ins) || !ctx.runtime_pc_base.empty() ||
+       ctx.runtime_arm_immediate || (ctx.alu_immediate_override_pcs &&
+       ctx.alu_immediate_override_pcs->count(ins.pc)))
+        throw std::invalid_argument("Unsupported bounded native-region instruction");
+    bool missing=false;
+    auto source=emit_reference_instr(ins,ctx,&missing);
+    if(missing) throw std::invalid_argument("Native-region instruction shape has no lowering");
+    if(not_implemented) *not_implemented=false;
+    // Admission already performed the yield/observer checks. No device event
+    // can occur inside the admitted prefix, so these per-instruction callbacks
+    // would only recreate the bookkeeping that the region removes.
+    for(const std::string line : {"    if (runtime_should_yield()) return;\n",
+                                 "    if (g_runtime_insn_trace) runtime_insn_fp();\n"}) {
+        for(auto at=source.find(line);at!=std::string::npos;at=source.find(line))
+            source.erase(at,line.size());
+    }
+    const std::string trace="if (runtime_trace_enabled()) runtime_trace_event(";
+    for(auto at=source.find(trace);at!=std::string::npos;at=source.find(trace)) {
+        const auto end=source.find('\n',at);
+        source.erase(at,end==std::string::npos ? source.size()-at : end+1-at);
+    }
+    // Rewrite complete identifiers, never substrings of labels/other names.
+    // All eligible operations share the established lowering above, including
+    // odd/unaligned load rules, conditional execution and instruction costs.
+    static const std::unordered_map<std::string,std::string> replacements = {
+        {"g_runtime_waits","_region.waits"},
+        {"g_runtime_insn_trace","_region.insn_trace"},
+        {"arm_cond_passes","_region.cpu.arm_cond_passes"},
+        {"arm_shift_lsl","_region.cpu.arm_shift_lsl"},
+        {"arm_shift_lsr","_region.cpu.arm_shift_lsr"},
+        {"arm_shift_asr","_region.cpu.arm_shift_asr"},
+        {"arm_shift_ror","_region.cpu.arm_shift_ror"},
+        {"arm_set_nz","_region.cpu.arm_set_nz"},
+        {"arm_set_nzc_logic","_region.cpu.arm_set_nzc_logic"},
+        {"arm_set_nzcv_add","_region.cpu.arm_set_nzcv_add"},
+        {"arm_set_nzcv_adc","_region.cpu.arm_set_nzcv_adc"},
+        {"arm_set_nzcv_sub","_region.cpu.arm_set_nzcv_sub"},
+        {"arm_set_nzcv_sbc","_region.cpu.arm_set_nzcv_sbc"},
+        {"cpsr_n","_region.cpu.cpsr_n"},
+        {"cpsr_z","_region.cpu.cpsr_z"},
+        {"cpsr_c","_region.cpu.cpsr_c"},
+        {"cpsr_v","_region.cpu.cpsr_v"},
+        {"bus_read_u8","_region.bus_read_u8"},
+        {"bus_read_u16","_region.bus_read_u16"},
+        {"bus_read_u32","_region.bus_read_u32"},
+        {"bus_write_u8","_region.bus_write_u8"},
+        {"bus_write_u16","_region.bus_write_u16"},
+        {"bus_write_u32","_region.bus_write_u32"},
+        {"runtime_should_yield","_region.runtime_should_yield"},
+        {"runtime_tick","_region.runtime_tick"},
+        {"runtime_trace_enabled","_region.runtime_trace_enabled"},
+        {"runtime_insn_fp","_region.runtime_insn_fp"},
+        {"runtime_mem_cycles","_region.runtime_mem_cycles"},
+        {"runtime_prefetch_adjust","_region.runtime_prefetch_adjust"},
+    };
+    std::string result;
+    for(std::size_t i=0;i<source.size();) {
+        const auto identifier=[](char c) { return (c>='a'&&c<='z') ||
+            (c>='A'&&c<='Z') || (c>='0'&&c<='9') || c=='_'; };
+        if(!identifier(source[i])) { result+=source[i++]; continue; }
+        const auto start=i;
+        while(i<source.size() && identifier(source[i])) ++i;
+        const auto token=source.substr(start,i-start);
+        const auto found=replacements.find(token);
+        result+=found==replacements.end() ? token : found->second;
+    }
+    return result;
 }
 
 CodegenResult ArmCodegen::emit_block(const std::vector<Instr>& block,

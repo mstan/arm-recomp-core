@@ -103,10 +103,14 @@ struct CodegenCtx {
     // `goto L_<addr>` instead of a C call, keeping split loops inside a single
     // host frame. nullptr → forward in-body branches lower to calls as before.
     const std::unordered_set<uint32_t>* in_body_goto_targets = nullptr;
+
+    // A bounded local-CPU/RAM block, with prefix settlement on device access.
+    bool native_region = false;
 };
 
 class ArmCodegen {
 public:
+    static bool supports_native_region(const Instr&);
     static bool supports_runtime_arm_immediate(const Instr& i) {
         return !i.thumb && !i.is_undefined && i.cond == Cond::AL &&
             !i.set_flags && i.rd < 15 && i.op2.kind == Op2::Kind::Imm &&
