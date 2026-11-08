@@ -45,3 +45,24 @@ Runtime ABIs remain consumer-owned. NDS keeps `runtime_arm.h`, dual-CPU
 dispatch, CP15, live overlays, and bus fast paths in `ndsrecomp`; GBA keeps its
 runtime dispatch, symbol registration, overlay shims, and GBA bus/device model
 in `gbarecomp`.
+
+## Interpreter storage contracts
+
+The common interpreter retains the structured `CPUState` API. An overload
+accepts `PackedCpuStateView` over the shared C ABI `ArmCpuState`, using the
+same instruction implementation. The view aliases R0-R14 and bank arrays;
+PC and modeled CPSR bits are projected until `publish_control()` is called.
+Callers must publish at their existing observation boundaries. Bus callbacks
+see that published PC/CPSR, while multi-access instructions can expose partial
+general-register updates through canonical storage. The view must not outlive
+its backing state and cannot be copied or moved.
+
+The packed control projection drops unmodeled CPSR bits, matching the
+structured API. This is a caller-selected storage contract, not a new CPU
+model, timing model or automatic publication policy. The GBA profile remains
+independent.
+
+Configure with `-DARM_RECOMP_CORE_BUILD_TESTS=ON` to run `packed_state_test`
+through CTest. It compares both common storage contracts across all Thumb
+encodings, deterministic ARM samples, exception banks and bus control/cycle
+transcripts. Consumer scheduler/device integration remains a consumer test.

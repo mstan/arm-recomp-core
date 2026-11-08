@@ -41,6 +41,7 @@
 #include "arm_ir.h"
 #include "bus.h"
 #include "cpu_state.h"
+#include "packed_cpu_view.h"
 
 namespace armv4t {
 
@@ -59,14 +60,20 @@ public:
     // `cycle_cost` table for the model. Pass nullptr to ignore.
     static Result step(CPUState& cpu, Bus& bus, const Instr& i,
                        uint32_t* cycles_out = nullptr);
+    // Same semantics over canonical active/banked storage with caller-published
+    // PC/CPSR. See packed_cpu_view.h for callback visibility and lifetime.
+    static Result step(PackedCpuStateView& cpu, Bus& bus, const Instr& i,
+                       uint32_t* cycles_out = nullptr);
 
     // Read a register with PC-pipeline adjustment baked in. Public so
     // tests can verify the rule directly.
     static uint32_t read_reg(const CPUState& cpu, uint8_t r, const Instr& i);
+    static uint32_t read_reg(const PackedCpuStateView& cpu, uint8_t r, const Instr& i);
 
     // Evaluate a condition code against CPSR. Returns true if the
     // instruction should execute.
     static bool cond_passes(Cond c, const CPSR& cpsr);
+    static bool cond_passes(Cond c, const PackedCpsrView& cpsr);
 
     // Take an IRQ exception. Caller must check that IE/IF/IME and
     // CPSR.I permit the entry; this function does no gating.
@@ -83,6 +90,7 @@ public:
     // have executed if the IRQ hadn't fired. For IRQs taken between
     // instructions, that's `cpu.R[15]` at the call site.
     static void enter_irq(CPUState& cpu, uint32_t return_address);
+    static void enter_irq(PackedCpuStateView& cpu, uint32_t return_address);
 
     // Take a Software Interrupt (SWI) exception. Called when step()
     // returns Result::Swi. Mirrors ARM ARM A2.6.4 SWI entry:
@@ -97,6 +105,8 @@ public:
     // (already adjusted by the caller for ARM/THUMB instruction width).
     // The BIOS's standard `MOVS PC, R14` epilogue then returns to it.
     static void enter_swi(CPUState& cpu, uint32_t return_address,
+                          bool from_thumb);
+    static void enter_swi(PackedCpuStateView& cpu, uint32_t return_address,
                           bool from_thumb);
 };
 
