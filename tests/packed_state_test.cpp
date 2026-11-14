@@ -156,6 +156,24 @@ static void exception_returns(bool packed) {
         require(reads==(op==2?1u:0u),"only LDM reads the return target from memory");
     }
 }
+static void thumb_conditional_decode() {
+    // Compare against architectural opcode families, independently of both
+    // storage contracts sharing the same decoder/interpreter implementation.
+    constexpr uint32_t pc=0x02000100u;
+    for(unsigned imm=0;imm<256;++imm) {
+        const auto reserved=ThumbDecoder::decode(uint16_t(0xde00u|imm),pc);
+        require(reserved.op==IrOp::Undefined && !reserved.is_branch,"all Thumb DExx encodings are undefined");
+        const auto swi=ThumbDecoder::decode(uint16_t(0xdf00u|imm),pc);
+        require(swi.op==IrOp::SWI && swi.swi_imm==imm,"Thumb DFxx retains SWI immediate");
+        const int32_t displacement=imm<128?int32_t(imm):int32_t(imm)-256;
+        for(unsigned cond=0;cond<14;++cond) {
+            const auto branch=ThumbDecoder::decode(uint16_t(0xd000u|(cond<<8)|imm),pc);
+            require(branch.op==IrOp::B && branch.is_branch && branch.cond==Cond(cond),"valid Thumb conditional branches retain condition");
+            require(branch.branch_target==uint32_t(pc+4u+displacement*2),"valid Thumb conditional branches retain target");
+        }
+    }
+    std::printf("PASS 256 reserved Thumb DExx encodings, 256 SWIs and 3584 valid conditional branches\n");
+}
 int main(int argc,char** argv){
     if(argc==2) {
         const bool packed=std::strcmp(argv[1],"--exception-return-packed")==0;
@@ -165,6 +183,7 @@ int main(int argc,char** argv){
         return 0;
     }
     require(argc==1,"test arguments");
+    thumb_conditional_decode();
     static_assert(!std::is_copy_constructible_v<PackedCpuStateView>);
     static_assert(!std::is_move_constructible_v<PackedCpuStateView>);
     ArmCpuState p{};p.cpsr=~0u;PackedCpuStateView v(p);
