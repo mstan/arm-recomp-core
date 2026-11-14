@@ -404,7 +404,9 @@ void exception_return(CPUState& cpu, uint32_t new_pc) {
     cpu.R[13] = cpu.banked_sp[new_bank];
     cpu.R[14] = cpu.banked_lr[new_bank];
 
-    cpu.R[15] = new_pc;
+    // SPSR selects the restored instruction set; low target bits do not
+    // select it as they would for BX. Ignore bits[0] in Thumb, [1:0] in ARM.
+    cpu.R[15] = new_pc & ~(cpu.cpsr.t ? 1u : 3u);
 }
 
 void restore_cpsr_from_spsr(CPUState& cpu) {
