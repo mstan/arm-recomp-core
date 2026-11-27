@@ -1,5 +1,7 @@
 # arm-recomp-core
 
+Current licensing and the grant for existing owner contributions are documented in [LICENSE-SCOPE.md](LICENSE-SCOPE.md).
+
 Shared ARM recompiler architecture core used by ARM-based recompilation
 projects.
 
