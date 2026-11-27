@@ -21,3 +21,13 @@ if(ARM_RECOMP_CORE_BUILD_TESTS)
     add_test(NAME exception_return_structured_test COMMAND packed_state_test --exception-return-structured)
     add_test(NAME exception_return_packed_test COMMAND packed_state_test --exception-return-packed)
 endif()
+
+# Compile the native generation profiles independently of a console runtime.
+foreach(profile armv4t_gba armv5te_nds)
+    arm_recomp_core_sources(profile_sources ${profile})
+    list(FILTER profile_sources EXCLUDE REGEX "interpreter[.]cpp$")
+    arm_recomp_core_include_dirs(profile_includes ${profile})
+    add_library(arm_recomp_${profile} STATIC ${profile_sources})
+    target_include_directories(arm_recomp_${profile} PUBLIC ${profile_includes})
+    target_compile_features(arm_recomp_${profile} PUBLIC cxx_std_20)
+endforeach()
