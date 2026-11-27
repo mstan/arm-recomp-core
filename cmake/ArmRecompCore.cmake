@@ -42,5 +42,6 @@ function(arm_recomp_core_include_dirs out_var profile)
             "Unknown arm-recomp-core profile '${profile}'; expected armv4t, armv4t_gba, or armv5te_nds")
     endif()
 
+    list(APPEND include_dirs "${ARM_RECOMP_CORE_ROOT}/include")
     set(${out_var} "${include_dirs}" PARENT_SCOPE)
 endfunction()

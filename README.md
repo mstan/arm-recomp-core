@@ -5,6 +5,17 @@ Current licensing and the grant for existing owner contributions are documented 
 Shared ARM recompiler architecture core used by ARM-based recompilation
 projects.
 
+`include/arm_recomp/alu.hpp` provides inline C++17 arithmetic, condition,
+shift/rotate and sign-extension primitives. The existing common and GBA
+profiles use this same implementation. Direct consumers may keep their own
+instruction descriptors, profile exclusions, state layouts and carry-action
+encodings while using the primitives without runtime dispatch or state copies.
+Condition evaluation retains lazy flag access for packed state views.
+Instruction operand helpers additionally preserve the carry-update action,
+encoded immediate count policy and low-byte register count policy. Their carry
+getter observes caller state only for RRX; full-width primitive shifts remain
+available for callers with that wider contract.
+
 This repository is a source package, not a standalone runtime. Consumers own
 their platform runtime ABI, memory map, generated dispatch tables, scheduler,
 and device models. The shared core owns architecture-facing pieces such as ARM

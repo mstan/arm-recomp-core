@@ -8,11 +8,15 @@ include("${CMAKE_CURRENT_LIST_DIR}/cmake/ArmRecompCore.cmake")
 # small tools/tests that only need the architectural types.
 add_library(arm_recomp_core_headers INTERFACE)
 target_include_directories(arm_recomp_core_headers INTERFACE
-    "${CMAKE_CURRENT_LIST_DIR}/common")
+    "${CMAKE_CURRENT_LIST_DIR}/common" "${CMAKE_CURRENT_LIST_DIR}/include")
 
 option(ARM_RECOMP_CORE_BUILD_TESTS "Build common-core storage contract tests" OFF)
 if(ARM_RECOMP_CORE_BUILD_TESTS)
     enable_testing()
+    add_executable(alu_contract_test tests/alu_contract_test.cpp)
+    target_link_libraries(alu_contract_test PRIVATE arm_recomp_core_headers)
+    set_target_properties(alu_contract_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME alu_contract_test COMMAND alu_contract_test)
     arm_recomp_core_sources(common_test_sources armv4t)
     add_executable(packed_state_test tests/packed_state_test.cpp ${common_test_sources})
     target_link_libraries(packed_state_test PRIVATE arm_recomp_core_headers)
