@@ -107,7 +107,83 @@ static void compare(Instr in,unsigned mode=0x13) {
     require(a.memory==b.memory,"memory effects");
     require(s.thumb==bool(view.thumb),"Thumb projection");
 }
-int main(){
+static void exception_returns(bool packed) {
+    // Independent architectural expectations: SPSR.T selects ARM/Thumb;
+    // target low bits are ignored for that restored state, unlike BX.
+    const uint32_t returns[]={0xe1b0f00e,0xe25ef004,0xe8d08000};
+    for(unsigned op=0;op<3;++op)for(unsigned thumb=0;thumb<2;++thumb)for(unsigned low=0;low<4;++low) {
+        ++cases;
+        const uint32_t target=0x300u|low;
+        ArmCpuState actual{};
+        for(unsigned r=0;r<16;++r)actual.R[r]=0x11110000u+r;
+        actual.R[0]=0x2000;actual.R[13]=0x1000;
+        actual.R[14]=target+(op==1?4u:0u);actual.R[15]=0x100;
+        actual.cpsr=0xf80000d3u; // SVC/ARM, all flags and I/F initially set.
+        actual.banked_sp[Bank_User]=0x500;
+        actual.banked_lr[Bank_User]=0x9876;
+        actual.banked_spsr[Bank_Supervisor]=0xa800001fu|(thumb?0x20u:0u);
+        ArmCpuState expected=actual;
+        expected.R[13]=0x500;expected.R[14]=0x9876;
+        expected.R[15]=target&~(thumb?1u:3u);
+        expected.cpsr=actual.banked_spsr[Bank_Supervisor];
+        expected.banked_sp[Bank_Supervisor]=actual.R[13];
+        expected.banked_lr[Bank_Supervisor]=actual.R[14];
+        TestBus bus(actual);
+        bus.write32(0x2000,target);bus.events.clear();
+        const auto memory=bus.memory;
+        const Instr instruction=ArmDecoder::decode(returns[op],0x100);
+        uint32_t cycles=0;Interpreter::Result result;
+        if(packed) {
+            PackedCpuStateView view(actual);view.publish_control();
+            result=Interpreter::step(view,bus,instruction,&cycles);
+            require(bool(view.thumb)==bool(thumb),"packed restored Thumb projection");
+            view.publish_control();
+        } else {
+            CPUState state=structured(actual);
+            result=Interpreter::step(state,bus,instruction,&cycles);
+            require(state.thumb==bool(thumb),"structured restored Thumb projection");
+            actual=snapshot(state);
+        }
+        require(result==Interpreter::Result::Branched,"exception return branches");
+        require(actual.R[15]==expected.R[15],"PC alignment follows restored SPSR.T");
+        require(std::memcmp(&actual,&expected,sizeof actual)==0,"independent full exception-return state");
+        require(cycles!=0,"exception return retains cycle accounting");
+        require(bus.memory==memory,"exception return does not write memory");
+        unsigned reads=0;
+        for(const auto& event:bus.events)if(event.kind==4) {
+            ++reads;require(event.addr==0x2000 && event.value==target,"LDM reads original return target");
+        }
+        require(reads==(op==2?1u:0u),"only LDM reads the return target from memory");
+    }
+}
+static void thumb_conditional_decode() {
+    // Compare against architectural opcode families, independently of both
+    // storage contracts sharing the same decoder/interpreter implementation.
+    constexpr uint32_t pc=0x02000100u;
+    for(unsigned imm=0;imm<256;++imm) {
+        const auto reserved=ThumbDecoder::decode(uint16_t(0xde00u|imm),pc);
+        require(reserved.op==IrOp::Undefined && !reserved.is_branch,"all Thumb DExx encodings are undefined");
+        const auto swi=ThumbDecoder::decode(uint16_t(0xdf00u|imm),pc);
+        require(swi.op==IrOp::SWI && swi.swi_imm==imm,"Thumb DFxx retains SWI immediate");
+        const int32_t displacement=imm<128?int32_t(imm):int32_t(imm)-256;
+        for(unsigned cond=0;cond<14;++cond) {
+            const auto branch=ThumbDecoder::decode(uint16_t(0xd000u|(cond<<8)|imm),pc);
+            require(branch.op==IrOp::B && branch.is_branch && branch.cond==Cond(cond),"valid Thumb conditional branches retain condition");
+            require(branch.branch_target==uint32_t(pc+4u+displacement*2),"valid Thumb conditional branches retain target");
+        }
+    }
+    std::printf("PASS 256 reserved Thumb DExx encodings, 256 SWIs and 3584 valid conditional branches\n");
+}
+int main(int argc,char** argv){
+    if(argc==2) {
+        const bool packed=std::strcmp(argv[1],"--exception-return-packed")==0;
+        require(packed || std::strcmp(argv[1],"--exception-return-structured")==0,"known test selection");
+        exception_returns(packed);
+        std::printf("PASS %u independent exception-return cases (%s storage)\n",cases,packed?"packed":"structured");
+        return 0;
+    }
+    require(argc==1,"test arguments");
+    thumb_conditional_decode();
     static_assert(!std::is_copy_constructible_v<PackedCpuStateView>);
     static_assert(!std::is_move_constructible_v<PackedCpuStateView>);
     ArmCpuState p{};p.cpsr=~0u;PackedCpuStateView v(p);
@@ -142,5 +218,6 @@ int main(){
     for(auto raw:edge)for(auto mode:modes)compare(ArmDecoder::decode(raw,0x02000100),mode);
     for(unsigned raw=0;raw<65536;++raw)compare(ThumbDecoder::decode(uint16_t(raw),0x02000100),modes[raw%7]);
     for(unsigned n=0;n<50000;++n)compare(ArmDecoder::decode(next(),0x02000100),modes[n%7]);
+    exception_returns(false);exception_returns(true);
     std::printf("PASS %u decoded instructions, full state, bus/control/cycle transcripts; proxy and exception contracts\n",cases);
 }

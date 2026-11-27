@@ -414,6 +414,7 @@ Instr ThumbDecoder::fmt16_cond_branch(uint16_t hw, uint32_t pc) {
     Instr i; zero_instr(i, hw, pc);
     uint8_t c = static_cast<uint8_t>(bits(hw, 11, 8));
     if (c == 0xF) return fmt17_swi(hw, pc);  // SWI shares the prefix
+    if (c == 0xE) return undefined(hw, pc); // Reserved in ARMv4T/ARMv5 Thumb.
     int32_t off = static_cast<int8_t>(bits(hw, 7, 0));
     i.cond = static_cast<Cond>(c);
     i.op = IrOp::B;
