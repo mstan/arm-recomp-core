@@ -27,6 +27,21 @@ int main() {
     CHECK(shift(0x80000001u,ShiftKind::Asr,0,true,false).value==0xffffffffu);
     CHECK(shift(0x80000001u,ShiftKind::Rrx,0,true,false).value==0x40000000u);
     CHECK(shift(0x80000001u,ShiftKind::Rrx,0,true,true).value==0xc0000000u);
+    for(unsigned carry=0;carry<2;++carry)for(unsigned kind=0;kind<4;++kind)
+        for(unsigned amount=0;amount<32;++amount)for(auto value:{0u,1u,0x80000000u,0xffffffffu,0x12345678u}) {
+            unsigned reads=0;
+            auto actual=operand_immediate_shift(value,OperandShiftKind(kind),amount,
+                [&]() noexcept {++reads;return carry!=0u;});
+            auto expected=shift(value,kind==3u&&!amount ? ShiftKind::Rrx:ShiftKind(kind),amount,true,carry!=0u);
+            CHECK(actual.value==expected.value);
+            CHECK(actual.carry_action==(kind==0u&&!amount ? 0u:1u+expected.carry));
+            CHECK(reads==(kind==3u&&!amount ? 1u:0u));
+        }
+    for(unsigned kind=0;kind<4;++kind)for(auto count:{0u,1u,31u,32u,33u,255u,256u,257u,0xffffffffu}) {
+        auto actual=operand_register_shift(0x80000001u,OperandShiftKind(kind),count);
+        auto expected=shift(0x80000001u,ShiftKind(kind),count&255u,false,false);
+        CHECK(actual.value==expected.value&&actual.carry_action==((count&255u) ? 1u+expected.carry:0u));
+    }
     CHECK(rotate_right(0x80000001u,32)==0x80000001u);
     CHECK(arithmetic_shift_right(0x80000001u,32)==0xffffffffu);
     CHECK(arithmetic_shift_right(0x7fffffffu,33)==0);

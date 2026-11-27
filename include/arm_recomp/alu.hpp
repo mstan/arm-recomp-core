@@ -21,7 +21,7 @@ constexpr std::uint32_t rotate_right(std::uint32_t value, unsigned amount) noexc
     amount &= 31u;
     return amount ? (value >> amount) | (value << (32u - amount)) : value;
 }
-constexpr std::uint32_t arithmetic_shift_right(std::uint32_t value, unsigned amount) noexcept {
+ARM_RECOMP_ALU_INLINE constexpr std::uint32_t arithmetic_shift_right(std::uint32_t value, unsigned amount) noexcept {
     if (!amount) return value;
     if (amount >= 32u) return (value >> 31u) ? 0xffff'ffffu : 0u;
     const auto shifted = value >> amount;
@@ -40,7 +40,7 @@ constexpr std::int32_t sign_extend(std::uint32_t value, unsigned bits) noexcept 
 // Register-count low-byte selection and carry-preserve action codes stay adapters.
 // Keep constant encoding/count policies visible to each CPU caller. In particular,
 // immediate shifts must not gain an out-of-line generic dispatch in the hot path.
-ARM_RECOMP_ALU_INLINE constexpr ShiftResult shift(std::uint32_t value, ShiftKind kind, std::uint32_t count,
+constexpr ShiftResult shift(std::uint32_t value, ShiftKind kind, std::uint32_t count,
                             bool encoded_zero, bool carry_in) noexcept {
     switch (kind) {
     case ShiftKind::Lsl:
@@ -64,6 +64,101 @@ ARM_RECOMP_ALU_INLINE constexpr ShiftResult shift(std::uint32_t value, ShiftKind
     }
     return {value,carry_in ? 1u : 0u};
 }
+// ARM instruction operand shifts report a carry effect rather than copying CPSR.
+// carry_action is 0=preserve, 1=clear, 2=set. Register counts use their low byte.
+enum class OperandShiftKind : std::uint8_t { Lsl, Lsr, Asr, Ror };
+struct OperandShiftResult { std::uint32_t value, carry_action; };
+ARM_RECOMP_ALU_INLINE constexpr OperandShiftResult operand_register_shift(const std::uint32_t value,
+    const OperandShiftKind kind, const std::uint32_t count) noexcept {
+    const std::uint32_t amount = count & 0xffu;
+    std::uint32_t shifted = value;
+    std::uint32_t carry_action = 0u;
+    if (amount != 0u) {
+        switch (kind) {
+        case OperandShiftKind::Lsl:  // LSL
+            if (amount < 32u) {
+                shifted = value << amount;
+                carry_action = 1u + ((value >> (32u - amount)) & 1u);
+            } else if (amount == 32u) {
+                shifted = 0u;
+                carry_action = 1u + (value & 1u);
+            } else {
+                shifted = 0u;
+                carry_action = 1u;
+            }
+            break;
+        case OperandShiftKind::Lsr:  // LSR
+            if (amount < 32u) {
+                shifted = value >> amount;
+                carry_action = 1u + ((value >> (amount - 1u)) & 1u);
+            } else if (amount == 32u) {
+                shifted = 0u;
+                carry_action = 1u + (value >> 31u);
+            } else {
+                shifted = 0u;
+                carry_action = 1u;
+            }
+            break;
+        case OperandShiftKind::Asr:  // ASR
+            if (amount < 32u) {
+                shifted = arithmetic_shift_right(value, amount);
+                carry_action = 1u + ((value >> (amount - 1u)) & 1u);
+            } else {
+                shifted = arithmetic_shift_right(value, 32u);
+                carry_action = 1u + (value >> 31u);
+            }
+            break;
+        case OperandShiftKind::Ror: {  // ROR
+            const std::uint32_t rotation = amount & 31u;
+            shifted = rotate_right(value, rotation);
+            carry_action = 1u + (shifted >> 31u);
+            break;
+        }
+        }
+    }
+    return {shifted, carry_action};
+}
+// amount is the decoded five-bit immediate field (0..31). Zero has its ISA
+// encoding meaning. The nonthrowing carry getter runs once for RRX only.
+template<class GetCarry>
+ARM_RECOMP_ALU_INLINE constexpr OperandShiftResult operand_immediate_shift(
+    std::uint32_t value, OperandShiftKind kind, std::uint32_t amount,
+    GetCarry get_carry) noexcept {
+    std::uint32_t shifted = value;
+    std::uint32_t carry_action = 0u;
+    switch (static_cast<unsigned>(kind)) {
+    case 0u:  // LSL
+        if (amount != 0u) {
+            shifted = value << amount;
+            carry_action = 1u + ((value >> (32u - amount)) & 1u);
+        }
+        break;
+    case 1u:  // LSR; an immediate zero encodes 32.
+        shifted = amount == 0u ? 0u : value >> amount;
+        carry_action =
+            1u + (amount == 0u ? value >> 31u
+                               : (value >> (amount - 1u)) & 1u);
+        break;
+    case 2u:  // ASR; an immediate zero encodes 32.
+        shifted = arithmetic_shift_right(value, amount == 0u ? 32u : amount);
+        carry_action =
+            1u + (amount == 0u ? value >> 31u
+                               : (value >> (amount - 1u)) & 1u);
+        break;
+    case 3u:  // ROR; an immediate zero encodes RRX.
+        if (amount == 0u) {
+            shifted = (get_carry() ? 0x8000'0000u : 0u) |
+                      (value >> 1u);
+            carry_action = 1u + (value & 1u);
+        } else {
+            shifted = rotate_right(value, amount);
+            carry_action = 1u + (shifted >> 31u);
+        }
+        break;
+    }
+    return {shifted,carry_action};
+}
+
 constexpr AddResult add_with_carry(std::uint32_t left, std::uint32_t right,
                                    std::uint32_t carry_in) noexcept {
     const auto sum=std::uint64_t(left)+std::uint64_t(right)+carry_in;
