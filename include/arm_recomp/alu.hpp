@@ -58,7 +58,7 @@ constexpr AddResult add_with_carry(std::uint32_t left, std::uint32_t right,
                                    std::uint32_t carry_in) noexcept {
     const auto sum=std::uint64_t(left)+std::uint64_t(right)+carry_in;
     const auto value=std::uint32_t(sum);
-    return {value,(sum >> 32u)!=0u,((~(left^right)&(left^value)) >> 31u)!=0u};
+    return {value,((sum >> 32u)&1u)!=0u,((~(left^right)&(left^value)) >> 31u)!=0u};
 }
 // Keep flag access lazy for packed views, matching the original switch.
 template<class Flags>

@@ -36,5 +36,6 @@ int main() {
     a=add_with_carry(0x7fffffffu,0,1);CHECK(a.value==0x80000000u&&!a.carry&&a.overflow);
     a=add_with_carry(0x80000000u,0xffffffffu,0);CHECK(a.value==0x7fffffffu&&a.carry&&a.overflow);
     a=add_with_carry(0x80000000u,0x80000000u,0);CHECK(a.value==0&&a.carry&&a.overflow);
+    a=add_with_carry(0xffffffffu,0xffffffffu,0xffffffffu);CHECK(a.value==0xfffffffdu&&!a.carry);
     std::puts("ARM ALU contracts PASS: condition truth table/lazy flags, shift boundaries, RRX, sign extension, carry/overflow");
 }
