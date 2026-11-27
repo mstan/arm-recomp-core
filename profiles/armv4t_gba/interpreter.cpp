@@ -1,6 +1,7 @@
 // interpreter.cpp — see interpreter.h.
 
 #include "interpreter.h"
+#include "../../include/arm_recomp/alu.hpp"
 
 #include <bit>
 #include <cstdint>
@@ -15,10 +16,8 @@ namespace {
 // Small helpers
 // ─────────────────────────────────────────────────────────────────────
 
-inline uint32_t rotr32(uint32_t v, uint32_t r) {
-    r &= 31;
-    if (r == 0) return v;
-    return (v >> r) | (v << (32 - r));
+inline uint32_t rotr32(uint32_t value, uint32_t amount) {
+    return arm_recomp::alu::rotate_right(value, amount);
 }
 
 inline bool sign_bit(uint32_t v) { return (v >> 31) & 1u; }
@@ -27,86 +26,26 @@ inline bool sign_bit(uint32_t v) { return (v >> 31) & 1u; }
 // register-shifted operand. cpsr_c is the current CPSR.C (used only
 // for RRX). The "by_register" form's count is the low 8 bits of Rs;
 // counts > 32 are handled per ARM ARM A5.1.5.
-struct ShiftResult { uint32_t value; uint32_t carry; };  // carry: 0/1
-ShiftResult do_shift(uint32_t rm_val, ShiftType type, uint32_t count,
-                     bool count_is_zero_in_encoding, bool cpsr_c) {
-    // For ARM register-form shifts where the count field in the
-    // encoding is literally 0:
-    //   LSL #0   → no shift, carry = CPSR.C
-    //   LSR #0   → treated as LSR #32: value=0, carry = bit 31 of Rm
-    //   ASR #0   → treated as ASR #32: arithmetic sign-extension
-    //   ROR #0   → RRX (handled as type=RRX before we get here)
-    // For shift-by-register, count is always the literal Rs[7:0].
-    switch (type) {
-        case ShiftType::LSL: {
-            if (count == 0) return {rm_val, cpsr_c ? 1u : 0u};
-            if (count < 32)  return {rm_val << count, (rm_val >> (32 - count)) & 1u};
-            if (count == 32) return {0u, rm_val & 1u};
-            return {0u, 0u};
-        }
-        case ShiftType::LSR: {
-            if (count == 0) {
-                if (count_is_zero_in_encoding) {
-                    // imm-form LSR #0 == LSR #32
-                    return {0u, (rm_val >> 31) & 1u};
-                }
-                return {rm_val, cpsr_c ? 1u : 0u};
-            }
-            if (count < 32)  return {rm_val >> count, (rm_val >> (count - 1)) & 1u};
-            if (count == 32) return {0u, (rm_val >> 31) & 1u};
-            return {0u, 0u};
-        }
-        case ShiftType::ASR: {
-            int32_t s = static_cast<int32_t>(rm_val);
-            if (count == 0) {
-                if (count_is_zero_in_encoding) {
-                    uint32_t v = (s < 0) ? 0xFFFFFFFFu : 0u;
-                    return {v, (rm_val >> 31) & 1u};
-                }
-                return {rm_val, cpsr_c ? 1u : 0u};
-            }
-            if (count < 32) {
-                uint32_t v = static_cast<uint32_t>(s >> count);
-                return {v, (rm_val >> (count - 1)) & 1u};
-            }
-            uint32_t v = (s < 0) ? 0xFFFFFFFFu : 0u;
-            return {v, (rm_val >> 31) & 1u};
-        }
-        case ShiftType::ROR: {
-            if (count == 0) return {rm_val, cpsr_c ? 1u : 0u};
-            uint32_t v = rotr32(rm_val, count);
-            return {v, (v >> 31) & 1u};
-        }
-        case ShiftType::RRX: {
-            uint32_t v = (rm_val >> 1) | ((cpsr_c ? 1u : 0u) << 31);
-            return {v, rm_val & 1u};
-        }
-    }
-    return {rm_val, cpsr_c ? 1u : 0u};
+using ShiftResult = arm_recomp::alu::ShiftResult;
+inline ShiftResult do_shift(uint32_t value, ShiftType type, uint32_t count,
+                            bool encoded_zero, bool carry_in) {
+    static_assert(unsigned(ShiftType::LSL)==0 && unsigned(ShiftType::LSR)==1 &&
+                  unsigned(ShiftType::ASR)==2 && unsigned(ShiftType::ROR)==3 && unsigned(ShiftType::RRX)==4);
+    return arm_recomp::alu::shift(value,static_cast<arm_recomp::alu::ShiftKind>(type),
+                                   count,encoded_zero,carry_in);
 }
 
 // Sign-extend lo-bit field to 32-bit.
-inline int32_t sext(uint32_t v, int bits) {
-    uint32_t mask = (bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
-    v &= mask;
-    int shift = 32 - bits;
-    return static_cast<int32_t>(v << shift) >> shift;
+inline int32_t sext(uint32_t value, int bits) {
+    return arm_recomp::alu::sign_extend(value,static_cast<unsigned>(bits));
 }
 
 // Arithmetic flag computation.
 struct ArithFlags { uint32_t result; bool n, z, c, v; };
 
-ArithFlags add_with_carry(uint32_t a, uint32_t b, uint32_t carry_in) {
-    uint64_t u = static_cast<uint64_t>(a) + static_cast<uint64_t>(b) + carry_in;
-    uint32_t r = static_cast<uint32_t>(u);
-    ArithFlags f{};
-    f.result = r;
-    f.n = sign_bit(r);
-    f.z = (r == 0);
-    f.c = (u >> 32) & 1ull;
-    // V: overflow when signs of a and b match and differ from result.
-    f.v = ((~(a ^ b) & (a ^ r)) >> 31) & 1u;
-    return f;
+inline ArithFlags add_with_carry(uint32_t a, uint32_t b, uint32_t carry_in) {
+    const auto sum=arm_recomp::alu::add_with_carry(a,b,carry_in);
+    return {sum.value,sign_bit(sum.value),sum.value==0,sum.carry,sum.overflow};
 }
 
 ArithFlags sub_with_carry(uint32_t a, uint32_t b, uint32_t carry_in) {
@@ -222,25 +161,7 @@ void Interpreter::enter_swi(CPUState& cpu, uint32_t return_address,
 }
 
 bool Interpreter::cond_passes(Cond c, const CPSR& cpsr) {
-    switch (c) {
-        case Cond::EQ: return  cpsr.z;
-        case Cond::NE: return !cpsr.z;
-        case Cond::CS: return  cpsr.c;
-        case Cond::CC: return !cpsr.c;
-        case Cond::MI: return  cpsr.n;
-        case Cond::PL: return !cpsr.n;
-        case Cond::VS: return  cpsr.v;
-        case Cond::VC: return !cpsr.v;
-        case Cond::HI: return  cpsr.c && !cpsr.z;
-        case Cond::LS: return !cpsr.c ||  cpsr.z;
-        case Cond::GE: return  cpsr.n == cpsr.v;
-        case Cond::LT: return  cpsr.n != cpsr.v;
-        case Cond::GT: return !cpsr.z && (cpsr.n == cpsr.v);
-        case Cond::LE: return  cpsr.z || (cpsr.n != cpsr.v);
-        case Cond::AL: return true;
-        case Cond::NV: return false;
-    }
-    return false;
+    return arm_recomp::alu::condition_passed(static_cast<uint8_t>(c),cpsr);
 }
 
 namespace {
