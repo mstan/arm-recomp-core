@@ -2,6 +2,14 @@
 #pragma once
 #include <cstdint>
 
+#if defined(_MSC_VER)
+#define ARM_RECOMP_ALU_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define ARM_RECOMP_ALU_INLINE inline __attribute__((always_inline))
+#else
+#define ARM_RECOMP_ALU_INLINE inline
+#endif
+
 namespace arm_recomp::alu {
 enum class ShiftKind : std::uint8_t { Lsl, Lsr, Asr, Ror, Rrx };
 struct ShiftResult { std::uint32_t value, carry; };
@@ -30,7 +38,9 @@ constexpr std::int32_t sign_extend(std::uint32_t value, unsigned bits) noexcept 
 }
 // The caller distinguishes immediate encoded-zero shifts from register counts.
 // Register-count low-byte selection and carry-preserve action codes stay adapters.
-constexpr ShiftResult shift(std::uint32_t value, ShiftKind kind, std::uint32_t count,
+// Keep constant encoding/count policies visible to each CPU caller. In particular,
+// immediate shifts must not gain an out-of-line generic dispatch in the hot path.
+ARM_RECOMP_ALU_INLINE constexpr ShiftResult shift(std::uint32_t value, ShiftKind kind, std::uint32_t count,
                             bool encoded_zero, bool carry_in) noexcept {
     switch (kind) {
     case ShiftKind::Lsl:
@@ -77,3 +87,4 @@ constexpr bool condition_passed(std::uint8_t condition, std::uint32_t cpsr) noex
                              ((cpsr>>29u)&1u)!=0u,((cpsr>>28u)&1u)!=0u});
 }
 } // namespace arm_recomp::alu
+#undef ARM_RECOMP_ALU_INLINE
